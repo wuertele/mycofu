@@ -92,6 +92,21 @@ for vm in dns1_prod dns2_prod vault_prod dns1_dev dns2_dev vault_dev pebble pbs 
   yq -i ".vms.${vm}.mac = \"${MAC}\"" "${SITE_DIR}/config.yaml"
 done
 
+# Generate MAC addresses for application VMs (any uncommented app with environments)
+for app in $(yq -r '.applications // {} | keys[]' "${SITE_DIR}/config.yaml" 2>/dev/null); do
+  for env in $(yq -r ".applications.${app}.environments // {} | keys[]" "${SITE_DIR}/config.yaml" 2>/dev/null); do
+    if yq -e ".applications.${app}.environments.${env}.mac" "${SITE_DIR}/config.yaml" &>/dev/null; then
+      MAC=$(generate_mac)
+      yq -i ".applications.${app}.environments.${env}.mac = \"${MAC}\"" "${SITE_DIR}/config.yaml"
+    fi
+    # Also handle mgmt_nic MAC if present
+    if yq -e ".applications.${app}.environments.${env}.mgmt_nic.mac" "${SITE_DIR}/config.yaml" &>/dev/null; then
+      MAC=$(generate_mac)
+      yq -i ".applications.${app}.environments.${env}.mgmt_nic.mac = \"${MAC}\"" "${SITE_DIR}/config.yaml"
+    fi
+  done
+done
+
 # Detect and install the operator's SSH public key
 OPERATOR_KEY=""
 for keyfile in ~/.ssh/id_ed25519.pub ~/.ssh/id_rsa.pub ~/.ssh/id_ecdsa.pub; do
