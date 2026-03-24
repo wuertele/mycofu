@@ -32,7 +32,7 @@ echo "Checking out main..."
 git checkout main
 
 echo "Applying framework changes from dev..."
-git diff main..dev -- framework/ docs/ README.md architecture.md GETTING-STARTED.md OPERATIONS.md .gitlab-ci.yml | git apply --allow-empty
+git diff main..dev -- framework/ docs/ README.md architecture.md GETTING-STARTED.md OPERATIONS.md .gitlab-ci.yml flake.nix flake.lock CLAUDE.md | git apply --allow-empty
 
 echo "Staging and committing..."
 git add -A
