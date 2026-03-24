@@ -177,30 +177,7 @@ creation_rules:
     age: "age1REPLACE_WITH_YOUR_AGE_PUBLIC_KEY"
 SOPS_EOF
 
-# --- Create secrets template ---
-if [[ ! -f "${SITE_DIR}/sops/secrets.yaml" ]]; then
-  cat > "${SITE_DIR}/sops/secrets.yaml" << 'SECRETS_EOF'
-# Bootstrap secrets — encrypt this file with SOPS before committing.
-#
-# Generate keys:
-#   ssh-keygen -t rsa -b 3072 -f /tmp/operator-key -N ""
-#   cat /tmp/operator-key.pub  # paste as ssh_pubkey
-#   cat /tmp/operator-key      # paste as ssh_privkey
-#
-# PowerDNS API key:
-#   openssl rand -hex 32
-#
-# After filling in values, encrypt:
-#   cd site/sops && sops -e -i secrets.yaml
-
-ssh_pubkey: "ssh-rsa AAAA... operator@workstation"
-ssh_privkey: |
-  -----BEGIN OPENSSH PRIVATE KEY-----
-  REPLACE_WITH_PRIVATE_KEY
-  -----END OPENSSH PRIVATE KEY-----
-pdns_api_key: "REPLACE_WITH_GENERATED_HEX"
-sops_age_key: "AGE-SECRET-KEY-REPLACE_WITH_YOUR_AGE_SECRET_KEY"
-SECRETS_EOF
+# --- Secrets created by bootstrap-sops.sh (not here) ---
 fi
 
 # --- Summary ---
@@ -210,8 +187,8 @@ echo ""
 echo "Generated files:"
 echo "  site/config.yaml          — edit with your IPs, subnets, and node details"
 echo "  site/images.yaml          — add site-specific VM roles here"
-echo "  site/sops/.sops.yaml      — update with your age public key"
-echo "  site/sops/secrets.yaml    — fill in SSH keys and API keys, then encrypt"
+echo "  site/nix/hosts/*.nix      — NixOS host configurations"
+echo "  site/tofu/overrides.tf    — site-specific OpenTofu overrides"
 echo ""
 echo "Next steps:"
 echo "  1. Edit site/config.yaml with your network configuration"
