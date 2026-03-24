@@ -1,0 +1,44 @@
+prompts/bringup-generator-delta-*-prompt.md
+operator.age.key
+
+# OpenTofu
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.backup
+*.tfplan
+site/tofu/image-versions.auto.tfvars
+site/tofu/image-versions.local.auto.tfvars
+
+# Tofu overrides symlink (conditional, created by tofu-wrapper.sh)
+framework/tofu/root/overrides.tf
+
+# Nix
+result
+result-*
+build/
+nixos.qcow2
+keys/
+
+# SOPS age key (NEVER commit the private key)
+*.age.key
+keys.txt
+
+# Python bytecode
+__pycache__/
+*.pyc
+
+# Nix build intermediate
+.nix-build-result
+
+# Editor
+.vscode/
+.idea/
+*.swp
+build/.gc-roots/
+
+# Generated configs
+site/gatus/config.yaml
+
+# Logs
+logs/

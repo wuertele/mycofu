@@ -1,0 +1,23 @@
+# Grafana configuration (REQUIRED)
+#
+# See: https://grafana.com/docs/grafana/latest/setup-grafana/configure-grafana/
+#
+# TLS settings (cert_file, cert_key, protocol, domain, root_url) are injected
+# automatically by the catalog module via environment variables at boot time.
+# Do NOT set them here — the module discovers the FQDN and cert paths from
+# the hostname + DHCP search domain.
+
+[server]
+http_port = 3000
+
+[security]
+admin_user = admin
+# Admin password is read from /run/secrets/grafana/admin-password (SOPS)
+# Do NOT put the password in this file
+
+[auth.anonymous]
+enabled = false
+
+[log]
+mode = console
+level = info

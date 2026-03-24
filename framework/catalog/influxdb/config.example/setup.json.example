@@ -1,0 +1,6 @@
+{
+  "org": "CHANGEME",
+  "bucket": "CHANGEME",
+  "retention": "30d",
+  "username": "admin"
+}

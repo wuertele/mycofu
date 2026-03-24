@@ -1,0 +1,177 @@
+# .gitlab-ci.yml — Infrastructure CI/CD pipeline.
+#
+# Two-tier deployment model (architecture.md section 10.3):
+# Tier 1 (pipeline): Data-plane VMs — DNS, Vault, Pebble, Gatus, apps.
+# Tier 2 (workstation): Control-plane VMs — GitLab, CI/CD runner, PBS.
+# The pipeline builds ALL roles (verifies buildability) but only deploys
+# data-plane targets. Control-plane images are built and uploaded, ready
+# for the operator to activate from the workstation.
+#
+# Branch model (architecture.md section 13.3):
+# dev branch push  → build + upload + deploy-dev + test-dev
+# prod branch push → build + upload + deploy-prod + test-prod
+# MR (any target)  → validate + build (no deploy)
+# Other branches   → no pipeline
+#
+# Runner: shell executor with all infrastructure tools (nix, tofu, sops, etc.)
+# Secrets: SOPS age key at /run/secrets/sops/age-key on the runner VM.
+
+# Prevent duplicate pipelines: only run for MR events or dev/prod pushes.
+# Feature branch pushes without an MR produce no pipeline.
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "prod"
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+
+stages:
+  - validate
+  - build
+  - deploy-dev
+  - test-dev
+  - deploy-prod
+  - test-prod
+
+variables:
+  SOPS_AGE_KEY_FILE: /run/secrets/sops/age-key
+
+# --- Validate ---
+
+validate:plan:
+  stage: validate
+  tags: [infra]
+  script:
+    - echo "=== OpenTofu Init ==="
+    - framework/scripts/tofu-wrapper.sh init -input=false
+    - echo "=== OpenTofu Validate ==="
+    - framework/scripts/tofu-wrapper.sh validate
+    - echo "=== OpenTofu Plan ==="
+    - framework/scripts/tofu-wrapper.sh plan -no-color
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "prod"
+
+validate:config:
+  stage: validate
+  tags: [infra]
+  script:
+    - echo "=== Config syntax check ==="
+    - yq e '.' site/config.yaml > /dev/null
+    - echo "Config YAML is valid"
+    - echo "=== Zone file syntax check ==="
+    - for f in site/dns/zones/*.yaml; do [ -f "$f" ] && yq e '.' "$f" > /dev/null; done || true
+    - echo "All zone files valid"
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "prod"
+
+validate:source-filter:
+  stage: validate
+  tags: [infra]
+  script:
+    - framework/scripts/check-source-filter.sh
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "prod"
+
+validate:nix-checks:
+  stage: validate
+  tags: [infra]
+  script:
+    - nix build .#checks.x86_64-linux.source-filter --no-link
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "prod"
+
+# --- Build ---
+
+build:images:
+  stage: build
+  tags: [infra]
+  script:
+    - echo "=== Building all NixOS images ==="
+    - framework/scripts/build-all-images.sh
+    - echo "=== Generating Gatus config ==="
+    - mkdir -p site/gatus
+    - framework/scripts/generate-gatus-config.sh > site/gatus/config.yaml
+  artifacts:
+    paths:
+      - site/tofu/image-versions.auto.tfvars
+      - site/gatus/config.yaml
+    expire_in: 1 hour
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "prod"
+
+# --- Deploy Dev ---
+
+deploy:dev:
+  stage: deploy-dev
+  tags: [infra]
+  dependencies:
+    - build:images
+  script:
+    - echo "=== Deploying to dev ==="
+    - framework/scripts/tofu-wrapper.sh init -input=false
+    - framework/scripts/safe-apply.sh dev
+    - echo "=== Cleaning stale replication ==="
+    - framework/scripts/configure-replication.sh "*"
+    - echo "=== Post-deploy recovery ==="
+    - framework/scripts/post-deploy.sh dev
+  rules:
+    - if: $CI_COMMIT_BRANCH == "dev"
+
+# --- Test Dev ---
+
+test:dev:
+  stage: test-dev
+  tags: [infra]
+  script:
+    - echo "=== Validating dev deployment ==="
+    - framework/scripts/validate.sh --regression-safe dev
+  rules:
+    - if: $CI_COMMIT_BRANCH == "dev"
+
+regression:
+  stage: test-dev
+  tags: [infra]
+  script:
+    - echo "=== Full regression suite ==="
+    - framework/scripts/validate.sh --regression dev
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+
+# --- Deploy Prod ---
+
+deploy:prod:
+  stage: deploy-prod
+  tags: [infra]
+  dependencies:
+    - build:images
+  script:
+    - echo "=== Deploying to prod ==="
+    - framework/scripts/tofu-wrapper.sh init -input=false
+    - framework/scripts/safe-apply.sh prod
+    - echo "=== Cleaning stale replication ==="
+    - framework/scripts/configure-replication.sh "*"
+    - echo "=== Post-deploy recovery ==="
+    - framework/scripts/post-deploy.sh prod
+  rules:
+    - if: $CI_COMMIT_BRANCH == "prod"
+
+# --- Test Prod ---
+
+test:prod:
+  stage: test-prod
+  tags: [infra]
+  script:
+    - echo "=== Validating prod deployment ==="
+    - framework/scripts/validate.sh --regression-safe prod
+  rules:
+    - if: $CI_COMMIT_BRANCH == "prod"

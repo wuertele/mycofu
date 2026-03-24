@@ -1,0 +1,335 @@
+## Proxmox Installation and Configuration
+
+### Per-Node Installation
+
+{%- for node in nodes %}
+
+#### {{ node.name }}
+
+1. - [ ] Boot {{ node.name }} from Proxmox ISO
+2. - [ ] Install to boot NVMe drive
+3. - [ ] During installation, set:
+
+| Setting | Value |
+|---------|-------|
+| Management IP | {{ node.mgmt_ip }} |
+| Hostname | {{ node.name }} |
+| DNS Server | {{ management.gateway }} |
+
+{# Temporary DNS: use the gateway until internal DNS is running #}
+
+4. - [ ] After install, access web UI at `https://{{ node.mgmt_ip }}:8006`
+5. - [ ] Verify SSH access: `ssh root@{{ node.mgmt_ip }}`
+{%- endfor %}
+
+### ZFS Pool Creation
+
+> If your nodes have a single NVMe, set `proxmox.storage_pool: local-zfs` in
+> `site/config.yaml` and skip this step. The Proxmox installer already created
+> the storage.
+
+Create the ZFS data pool on each node's data NVMe drive:
+
+```bash
+framework/scripts/configure-node-storage.sh --all
+```
+
+Or configure a single node:
+```bash
+framework/scripts/configure-node-storage.sh <node-name>
+```
+
+Preview what will be done without making changes:
+```bash
+framework/scripts/configure-node-storage.sh --dry-run --all
+```
+
+The script identifies the data NVMe automatically (the unpartitioned drive
+that is not the boot disk) and creates a ZFS pool named `{{ storage.pool_name }}`.
+
+If the script cannot identify the data drive (e.g., both NVMe drives have
+partitions, or there are more than two NVMe devices), it will report an error.
+In that case, identify the drive manually with `lsblk` and pass it explicitly:
+```bash
+framework/scripts/configure-node-storage.sh <node-name> --device /dev/nvme1n1
+```
+
+**Verification:**
+{% for node in nodes %}
+- [ ] {{ node.name }}: `ssh root@{{ node.mgmt_ip }} zpool status {{ storage.pool_name }}`
+      → ONLINE, no errors
+{% endfor %}
+
+### Node Network Configuration
+{%- if has_replication_network %}
+
+#### Physical Cabling Prerequisites
+
+Before running the network configuration script, verify that all point-to-point
+replication cables are connected:
+
+{%- for node in nodes %}
+{%- if node.repl_peers is defined and node.repl_peers %}
+{%- for peer_name, peer in node.repl_peers.items() %}
+{%- if node.name < peer_name %}
+- [ ] {{ node.name }} ({{ peer.iface }}) ↔ {{ peer_name }}: DAC cable connected
+{%- endif %}
+{%- endfor %}
+{%- endif %}
+{%- endfor %}
+
+#### Replication Network Topology
+
+{%- for node in nodes %}
+{%- if node.repl_peers is defined and node.repl_peers %}
+
+**{{ node.name }}:**
+{%- for peer_name, peer in node.repl_peers.items() %}
+- {{ peer.iface }} → {{ peer_name }}: local {{ peer.local_ip }}, peer {{ peer.peer_ip }}
+{%- endfor %}
+{%- endif %}
+{%- endfor %}
+{%- endif %}
+
+After all nodes are installed and reachable on the management network, run:
+
+```bash
+framework/scripts/configure-node-network.sh --all
+```
+
+Use `--all` for initial setup. Single-node mode is useful when re-deploying
+after a config change or when recovering a single node:
+```bash
+framework/scripts/configure-node-network.sh <node-name>
+```
+
+Preview what will be deployed without making changes:
+```bash
+framework/scripts/configure-node-network.sh --dry-run <node-name>
+```
+
+The script will generate and deploy `/etc/network/interfaces` on each node,
+configure `/etc/hosts`, `/etc/resolv.conf`, and `/etc/issue`, then verify
+connectivity.
+
+> **Note:** The script configures `vmbr0` as a VLAN-aware bridge and adds
+> `bridge-vlans` entries for each VLAN ID defined in `config.yaml → environments`.
+> This is required — a VLAN-aware bridge without explicit VLAN IDs will not
+> forward tagged frames. If VMs show zero rx-bytes after deployment, verify
+> that `/etc/network/interfaces` on the node includes the correct `bridge-vlans`
+> directive (e.g., `bridge-vlans 2-4094` or the specific VLAN IDs).
+
+Here is what it will configure:
+
+| Node | Interface | Role | IP |
+|------|-----------|------|----|
+{%- for node in nodes %}
+| {{ node.name }} | {{ node.mgmt_iface }} (vmbr0) | Management | {{ node.mgmt_ip }}/{{ management.subnet | cidr_prefix }} |
+{%- if node.repl_ip is defined and node.repl_ip %}
+| {{ node.name }} | dummy0 | Corosync ring0 | {{ node.repl_ip }}/32 |
+{%- endif %}
+{%- if node.repl_peers is defined and node.repl_peers %}
+{%- for peer_name, peer in node.repl_peers.items() %}
+| {{ node.name }} | {{ peer.iface }} | Replication → {{ peer_name }} | {{ peer.local_ip }} |
+{%- endfor %}
+{%- endif %}
+{%- endfor %}
+{%- if has_replication_network %}
+
+> **How replication network failover works:** Each node has two static routes
+> to each peer's corosync address — a direct route (low metric) and a fallback
+> route (high metric) through the third node. If a DAC cable fails, the kernel
+> detects carrier loss, removes the direct route, and traffic automatically
+> reroutes through the surviving node. All nodes have IP forwarding enabled
+> to support this relay behavior.
+{%- endif %}
+
+**Verification after running:**
+{%- for node in nodes %}
+- [ ] {{ node.name }}: management IP ({{ node.mgmt_ip }}) reachable
+{%- if node.repl_peers is defined and node.repl_peers %}
+{%- for peer_name, peer in node.repl_peers.items() %}
+- [ ] {{ node.name }}: replication link to {{ peer_name }} via {{ peer.iface }} — `ping {{ peer.peer_ip }}` succeeds
+{%- endfor %}
+{%- endif %}
+{%- if node.repl_ip is defined and node.repl_ip %}
+- [ ] {{ node.name }}: corosync address ({{ node.repl_ip }}) reachable from all peers
+{%- endif %}
+{%- endfor %}
+- [ ] All nodes: `bridge-vlan-aware yes` in `/etc/network/interfaces`
+{%- if has_replication_network %}
+{% if replication.topology == 'mesh' %}
+
+#### Replication Link Watchdog
+
+Each node runs a watchdog (`repl-watchdog.sh`) that pings each peer's
+point-to-point IP every 10 seconds. If a peer is unreachable for 30 seconds,
+the watchdog brings down the local interface to force traffic onto the fallback
+route via the third node. When the peer recovers, the watchdog brings the
+interface back up automatically.
+
+This converts asymmetric link failures (one end down, other end up) into
+symmetric failures that the dual-metric routing handles correctly.
+
+- Deployed by: `configure-node-network.sh`
+- Timer: `repl-watchdog.timer` (every 10s)
+- Logs: `journalctl -u repl-watchdog`
+- State: `/run/repl-watchdog/`
+{%- endif %}
+
+#### Replication Health Endpoint
+
+Each node exposes replication network health as JSON on port {{ replication.health_port | default(9100) }}:
+
+```bash
+{%- for node in nodes %}
+curl -s http://{{ node.mgmt_ip }}:{{ replication.health_port | default(9100) }}/health | jq .
+{%- endfor %}
+```
+
+This endpoint is scraped by the primary Gatus instance. A `healthy: false`
+response triggers an alert.
+
+{% if replication.topology == 'mesh' %}
+**Watchdog verification:**
+{%- for node in nodes %}
+- [ ] {{ node.name }}: `ssh root@{{ node.mgmt_ip }} systemctl is-active repl-watchdog.timer` → active
+{%- endfor %}
+{%- endif %}
+
+**Health endpoint verification:**
+{%- for node in nodes %}
+- [ ] {{ node.name }}: `curl -s http://{{ node.mgmt_ip }}:{{ replication.health_port | default(9100) }}/health | jq .healthy` → true
+{%- endfor %}
+{%- endif %}
+
+### Cluster Formation
+
+After network configuration is verified, form the Proxmox cluster:
+
+```bash
+framework/scripts/form-cluster.sh
+```
+
+Preview the commands without executing:
+```bash
+framework/scripts/form-cluster.sh --dry-run
+```
+
+Cluster name: **{{ cluster_name }}**
+{% if cluster.name == 'AUTO' %}
+(Auto-derived from domain `{{ domain }}`. To change, set `cluster.name`
+in `site/config.yaml`.)
+{% endif %}
+
+> **Note:** `form-cluster.sh` pre-distributes SSH keys between all nodes before
+> running any `pvecm` commands. This is the same key exchange that `pvecm` would
+> perform during join, done in advance to enable `--use_ssh` (non-interactive
+> join). The keys become part of the permanent cluster auth fabric at
+> `/etc/pve/priv/authorized_keys`.
+
+The following commands are executed automatically by `form-cluster.sh`.
+They are shown for reference only — **do not run them manually.**
+
+**Create cluster on {{ nodes[0].name }}:**
+```bash
+ssh root@{{ nodes[0].mgmt_ip }} \
+{%- if has_replication_network and nodes[0].repl_ip is defined %}
+  pvecm create {{ cluster_name }} \
+    --link0 {{ nodes[0].repl_ip }} \
+    --link1 {{ nodes[0].mgmt_ip }}
+{%- else %}
+  pvecm create {{ cluster_name }}
+{%- endif %}
+```
+
+{%- for node in nodes[1:] %}
+
+**Join {{ node.name }}:**
+```bash
+ssh root@{{ node.mgmt_ip }} \
+{%- if has_replication_network and node.repl_ip is defined %}
+  pvecm add {{ nodes[0].mgmt_ip }} --use_ssh \
+    --fingerprint <FINGERPRINT> \
+    --link0 {{ node.repl_ip }} \
+    --link1 {{ node.mgmt_ip }}
+{%- else %}
+  pvecm add {{ nodes[0].mgmt_ip }} --use_ssh \
+    --fingerprint <FINGERPRINT>
+{%- endif %}
+```
+{%- endfor %}
+
+### Verification
+
+```bash
+ssh root@{{ nodes[0].mgmt_ip }} pvecm status
+```
+
+- [ ] Cluster name: `{{ cluster_name }}`
+- [ ] {{ nodes | length }} nodes listed
+- [ ] All nodes online
+- [ ] `Quorate: Yes`
+{%- if has_replication_network %}
+
+```bash
+ssh root@{{ nodes[0].mgmt_ip }} corosync-cfgtool -s
+```
+- [ ] Link 0 (replication mesh): all nodes connected, no faults
+- [ ] Link 1 (management network): all nodes connected, no faults
+
+#### Replication Network Failover (optional manual test)
+
+To verify failover works, temporarily disable one interface on a node and
+confirm the fallback route takes over:
+
+```bash
+# On {{ nodes[0].name }}: disable direct link to {{ nodes[1].name }}
+ssh root@{{ nodes[0].mgmt_ip }} ip link set {{ nodes[0].repl_peers[nodes[1].name].iface }} down
+# Verify {{ nodes[1].name }}'s corosync address is still reachable (via {{ nodes[2].name }})
+ssh root@{{ nodes[0].mgmt_ip }} ping -c 3 {{ nodes[1].repl_ip }}
+# Re-enable the link
+ssh root@{{ nodes[0].mgmt_ip }} ip link set {{ nodes[0].repl_peers[nodes[1].name].iface }} up
+```
+{%- endif %}
+
+ZFS pools:
+{%- for node in nodes %}
+```bash
+ssh root@{{ node.mgmt_ip }} zpool status {{ storage.pool_name }}
+```
+- [ ] {{ node.name }}: ONLINE, no errors
+{%- endfor %}
+
+### Snippet Storage
+
+After cluster formation, enable cloud-init snippet storage on the cluster.
+OpenTofu uploads cloud-init user-data and meta-data as snippets to each node.
+
+```bash
+framework/scripts/configure-storage.sh
+```
+
+Preview what will be changed without modifying:
+```bash
+framework/scripts/configure-storage.sh --dry-run
+```
+
+This modifies `/etc/pve/storage.cfg` (cluster-synced) to add `snippets` to the
+`local` storage content types, and ensures `/var/lib/vz/snippets/` exists on
+each node.
+
+> **Image file extensions:** Proxmox's `local` storage (ISO content type) only
+> recognizes files with `.iso` or `.img` extensions. If you upload a `.raw` or
+> `.qcow2` file directly, Proxmox will silently ignore it — it won't appear in
+> the UI or be available for VM disk import. The `upload-image.sh` script handles
+> this by using the `.img` extension automatically.
+
+**Verify:**
+```bash
+framework/scripts/configure-storage.sh --verify
+```
+- [ ] `ssh root@{{ nodes[0].mgmt_ip }} "grep snippets /etc/pve/storage.cfg"` shows `snippets` in the content line
+{%- for node in nodes %}
+- [ ] {{ node.name }}: `ssh root@{{ node.mgmt_ip }} "ls -d /var/lib/vz/snippets"` succeeds
+{%- endfor %}
