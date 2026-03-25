@@ -346,11 +346,13 @@ start_builder_vm() {
       if [[ "$cur_bytes" -lt "$want_bytes" ]]; then
         echo "  Expanding store overlay to ${STORE_GB}GB..."
         dd if=/dev/zero of="$store_img" bs=1 count=0 seek=$want_bytes 2>/dev/null
-        # Wait for SSH to be ready, then resize filesystem inside VM
+        # SSH into builder to resize the filesystem. The builder SSH key
+        # is root-readable only (/etc/nix/builder_ed25519), so use sudo.
         local ssh_attempts=0
         while (( ssh_attempts < 30 )); do
           if nc -z localhost "${BUILDER_PORT}" 2>/dev/null; then
-            ssh -n -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            sudo ssh -n -i /etc/nix/builder_ed25519 \
+              -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
               -p "${BUILDER_PORT}" builder@localhost \
               "sudo resize2fs /dev/vdb" 2>/dev/null && \
               echo "  ✓ Store overlay expanded to ${STORE_GB}GB" || \

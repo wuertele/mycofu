@@ -168,7 +168,8 @@ reset_builder_overlay() {
       cur_bytes=$(stat -f%z "$overlay" 2>/dev/null || echo 0)
       if [[ "$cur_bytes" -lt "$want_bytes" ]]; then
         dd if=/dev/zero of="$overlay" bs=1 count=0 seek=$want_bytes 2>/dev/null
-        ssh -n -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+        sudo ssh -n -i /etc/nix/builder_ed25519 \
+          -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
           -p 31022 builder@localhost "sudo resize2fs /dev/vdb" 2>/dev/null || true
       fi
     fi
