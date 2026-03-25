@@ -160,17 +160,27 @@ reset_builder_overlay() {
         nc -z localhost 31022 2>/dev/null && break
         sleep 5
       done
-      # Expand store overlay after builder recreates it at default size
+      # Resize the new overlay to configured size (offline, no SSH)
       local store_gb
       store_gb=$(yq '.nix_builder.store_gb // 20' "${REPO_DIR}/site/config.yaml" 2>/dev/null || echo 20)
       local want_bytes=$(( store_gb * 1024 * 1024 * 1024 ))
       local cur_bytes
       cur_bytes=$(stat -f%z "$overlay" 2>/dev/null || echo 0)
       if [[ "$cur_bytes" -lt "$want_bytes" ]]; then
+        echo "  Resizing store overlay to ${store_gb}GB..."
+        pkill -f "qemu.*nixos.qcow2" 2>/dev/null || true
+        for i in $(seq 1 15); do
+          pgrep -f "qemu.*nixos.qcow2" >/dev/null 2>&1 || break
+          sleep 1
+        done
         dd if=/dev/zero of="$overlay" bs=1 count=0 seek=$want_bytes 2>/dev/null
-        sudo ssh -n -i /etc/nix/builder_ed25519 \
-          -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-          -p 31022 builder@localhost "sudo resize2fs /dev/vdb" 2>/dev/null || true
+        nix run nixpkgs#e2fsprogs -- e2fsck -fy "$overlay" 2>/dev/null || true
+        nix run nixpkgs#e2fsprogs -- resize2fs "$overlay" 2>/dev/null || true
+        bash "$BUILDER_START"
+        for i in $(seq 1 24); do
+          nc -z localhost 31022 2>/dev/null && break
+          sleep 5
+        done
       fi
     fi
   fi
