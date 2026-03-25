@@ -252,7 +252,7 @@ find_builder_pid() {
 # Write /etc/nix/machines with correct maxJobs matching configured CPUs.
 # Checks current content first to avoid unnecessary sudo prompts.
 write_machines_file() {
-  local expected_line="ssh-ng://linux-builder x86_64-linux ${BUILDER_SSH_KEY} ${CPUS} - - - nixos-test,benchmark,big-parallel,kvm"
+  local expected_line="ssh-ng://linux-builder x86_64-linux ${BUILDER_SSH_KEY} ${CPUS} 1 nixos-test,benchmark,big-parallel,kvm -"
 
   if [[ -f "$MACHINES_FILE" ]] && grep -qF "$expected_line" "$MACHINES_FILE" 2>/dev/null; then
     echo "  ✓ ${MACHINES_FILE}: maxJobs=${CPUS} (matches config)"
