@@ -304,9 +304,12 @@ done
 # on large closures (GitLab ~6.4GB). Pre-creating at ${STORE_GB}GB ensures
 # enough space for cold-start builds.
 STORE_IMG=~/.nix-builder/store.img
-if [[ ! -f "\$STORE_IMG" ]]; then
+STORE_WANT_BYTES=\$((${STORE_GB} * 1024 * 1024 * 1024))
+STORE_CUR_BYTES=\$(stat -f%z "\$STORE_IMG" 2>/dev/null || echo 0)
+if [[ "\$STORE_CUR_BYTES" -lt "\$STORE_WANT_BYTES" ]]; then
   echo "Creating \${STORE_IMG} (${STORE_GB}GB sparse)..."
-  dd if=/dev/zero of="\$STORE_IMG" bs=1 count=0 seek=\$((${STORE_GB} * 1024 * 1024 * 1024)) 2>/dev/null
+  rm -f "\$STORE_IMG"
+  dd if=/dev/zero of="\$STORE_IMG" bs=1 count=0 seek=\$STORE_WANT_BYTES 2>/dev/null
 fi
 
 nix run nixpkgs#darwin.linux-builder >> ~/.nix-builder/builder.log 2>&1 &
