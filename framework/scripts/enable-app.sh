@@ -167,9 +167,9 @@ DEFAULT_MONITOR=true
 
 # Override from variables.tf defaults if present
 if [[ -f "${CATALOG_DIR}/variables.tf" ]]; then
-  _ram=$(grep -A2 'variable "ram_mb"' "${CATALOG_DIR}/variables.tf" | grep 'default' | grep -oP '[0-9]+' | head -1 || true)
+  _ram=$(grep -A2 'variable "ram_mb"' "${CATALOG_DIR}/variables.tf" | grep 'default' | grep -o '[0-9]*' | head -1 || true)
   [[ -n "$_ram" ]] && DEFAULT_RAM=$_ram
-  _vdb=$(grep -A2 'variable "vdb_size_gb"' "${CATALOG_DIR}/variables.tf" | grep 'default' | grep -oP '[0-9]+' | head -1 || true)
+  _vdb=$(grep -A2 'variable "vdb_size_gb"' "${CATALOG_DIR}/variables.tf" | grep 'default' | grep -o '[0-9]*' | head -1 || true)
   [[ -n "$_vdb" ]] && DEFAULT_DATA_DISK=$_vdb
 fi
 
