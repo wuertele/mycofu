@@ -90,11 +90,11 @@ echo ""
 ENVS=$(yq -r '.environments | keys | .[]' "$CONFIG")
 
 # Generate MACs for each environment
-declare -A ENV_MACS
+# (uses eval for dynamic vars — macOS bash 3.2 lacks declare -A)
 echo "Generated MAC addresses:"
 for ENV in $ENVS; do
   MAC=$(generate_mac)
-  ENV_MACS[$ENV]="$MAC"
+  eval "ENV_MAC_${ENV}=\"${MAC}\""
   echo "  ${ENV}: ${MAC}"
 done
 echo ""
@@ -178,12 +178,12 @@ DEFAULT_NODE=$(find_best_node)
 read -rp "Node [${DEFAULT_NODE}]: " INPUT_NODE
 NODE="${INPUT_NODE:-${DEFAULT_NODE}}"
 
-declare -A ENV_IPS
 for ENV in $ENVS; do
   DEFAULT_IP=$(find_next_ip "$ENV")
   SUBNET=$(yq -r ".environments.${ENV}.subnet" "$CONFIG")
-  read -rp "${ENV^} IP (${SUBNET}) [${DEFAULT_IP}]: " INPUT_IP
-  ENV_IPS[$ENV]="${INPUT_IP:-${DEFAULT_IP}}"
+  ENV_LABEL=$(echo "$ENV" | awk '{print toupper(substr($0,1,1)) substr($0,2)}')
+  read -rp "${ENV_LABEL} IP (${SUBNET}) [${DEFAULT_IP}]: " INPUT_IP
+  eval "ENV_IP_${ENV}=\"${INPUT_IP:-${DEFAULT_IP}}\""
 done
 
 read -rp "RAM (MB) [${DEFAULT_RAM}]: " INPUT_RAM
@@ -211,8 +211,8 @@ APP_YAML="  ${APP}:
 for ENV in $ENVS; do
   APP_YAML="${APP_YAML}
       ${ENV}:
-        ip: ${ENV_IPS[$ENV]}
-        mac: \"${ENV_MACS[$ENV]}\""
+        ip: $(eval echo \"\$ENV_IP_${ENV}\")
+        mac: \"$(eval echo \"\$ENV_MAC_${ENV}\")\""
 done
 
 # Check if applications: block exists
@@ -235,8 +235,8 @@ YAMLEOF
   for ENV in $ENVS; do
     cat >> "$TEMP_YAML" <<YAMLEOF
   ${ENV}:
-    ip: ${ENV_IPS[$ENV]}
-    mac: "${ENV_MACS[$ENV]}"
+    ip: $(eval echo \"\$ENV_IP_${ENV}\")
+    mac: "$(eval echo \"\$ENV_MAC_${ENV}\")"
 YAMLEOF
   done
 
@@ -251,7 +251,7 @@ fi
 echo "Added to site/config.yaml:"
 echo "  applications.${APP}"
 for ENV in $ENVS; do
-  echo "    ${ENV}: IP ${ENV_IPS[$ENV]}, MAC ${ENV_MACS[$ENV]}"
+  echo "    ${ENV}: IP $(eval echo \"\$ENV_IP_${ENV}\"), MAC $(eval echo \"\$ENV_MAC_${ENV}\")"
 done
 echo ""
 
@@ -292,7 +292,7 @@ echo ""
 echo "DHCP reservations needed (configure on your gateway):"
 for ENV in $ENVS; do
   VLAN_ID=$(yq -r ".environments.${ENV}.vlan_id" "$CONFIG")
-  echo "  VLAN ${VLAN_ID} (${ENV}): MAC ${ENV_MACS[$ENV]} → IP ${ENV_IPS[$ENV]}"
+  echo "  VLAN ${VLAN_ID} (${ENV}): MAC $(eval echo \"\$ENV_MAC_${ENV}\") → IP $(eval echo \"\$ENV_IP_${ENV}\")"
 done
 
 # --- Next steps ---
