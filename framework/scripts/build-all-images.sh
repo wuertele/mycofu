@@ -160,10 +160,24 @@ reset_builder_overlay() {
     BUILDER_START="${HOME}/.nix-builder/start-builder.sh"
     if [[ -x "$BUILDER_START" ]]; then
       bash "$BUILDER_START"
-      for i in $(seq 1 24); do
-        nc -z localhost 31022 2>/dev/null && break
+      # Wait for builder SSH port (up to 180s — first boot downloads VM image)
+      local up=0
+      for i in $(seq 1 36); do
+        if nc -z localhost 31022 2>/dev/null; then
+          up=1
+          break
+        fi
         sleep 5
       done
+      if [[ "$up" -eq 0 ]]; then
+        echo "  ERROR: Builder failed to restart after overlay reset" >&2
+        return 1
+      fi
+      # Verify the builder actually works
+      if ! nix build nixpkgs#hello --no-link 2>/dev/null; then
+        echo "  ERROR: Builder restarted but test build failed" >&2
+        return 1
+      fi
     fi
   fi
 }
