@@ -7,7 +7,7 @@
 #     modules = [ ./framework/nix/modules/base.nix ];
 #   };
 
-{ nixpkgs, system ? "x86_64-linux", modules, diskSize ? "auto", additionalSpace ? "2048M", extraSpecialArgs ? {} }:
+{ nixpkgs, system ? "x86_64-linux", modules, diskSize ? "auto", additionalSpace ? "512M", extraSpecialArgs ? {} }:
 
 let
   nixos = nixpkgs.lib.nixosSystem {

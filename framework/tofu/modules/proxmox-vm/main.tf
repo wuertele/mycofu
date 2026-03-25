@@ -158,11 +158,12 @@ resource "proxmox_virtual_environment_vm" "vm" {
     dedicated = var.ram_mb
   }
 
-  # vda: OS disk imported from image
+  # vda: OS disk imported from image.
+  # Size is omitted — Proxmox uses the image's virtual size.
+  # ignore_changes on disk[0].size prevents drift on subsequent applies.
   disk {
     datastore_id = var.storage_pool
     interface    = "scsi0"
-    size         = var.vda_size_gb
     file_id      = var.image_file_id
     file_format  = "raw"
     discard      = "on"
