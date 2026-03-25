@@ -156,12 +156,10 @@ find_best_node() {
   echo "$best_node"
 }
 
-# Read catalog defaults if metadata exists
+# Read catalog defaults
 DEFAULT_RAM=1024
 DEFAULT_DISK=4
 DEFAULT_DATA_DISK=4
-DEFAULT_HEALTH_PORT=80
-DEFAULT_HEALTH_PATH="/"
 DEFAULT_BACKUP=false
 DEFAULT_MONITOR=true
 
@@ -171,6 +169,12 @@ if [[ -f "${CATALOG_DIR}/variables.tf" ]]; then
   [[ -n "$_ram" ]] && DEFAULT_RAM=$_ram
   _vdb=$(grep -A2 'variable "vdb_size_gb"' "${CATALOG_DIR}/variables.tf" | grep 'default' | grep -o '[0-9]*' | head -1 || true)
   [[ -n "$_vdb" ]] && DEFAULT_DATA_DISK=$_vdb
+fi
+
+# Set monitor default based on whether the catalog app has a health endpoint.
+# Health port/path are defined in framework/catalog/<app>/health.yaml.
+if [[ ! -f "${CATALOG_DIR}/health.yaml" ]]; then
+  DEFAULT_MONITOR=false
 fi
 
 # Prompt with defaults
@@ -204,8 +208,6 @@ APP_YAML="  ${APP}:
     data_disk_size: ${DATA_DISK}
     backup: ${DEFAULT_BACKUP}
     monitor: ${DEFAULT_MONITOR}
-    health_port: ${DEFAULT_HEALTH_PORT}
-    health_path: \"${DEFAULT_HEALTH_PATH}\"
     environments:"
 
 for ENV in $ENVS; do
@@ -228,8 +230,6 @@ disk_size: ${DEFAULT_DISK}
 data_disk_size: ${DATA_DISK}
 backup: ${DEFAULT_BACKUP}
 monitor: ${DEFAULT_MONITOR}
-health_port: ${DEFAULT_HEALTH_PORT}
-health_path: "${DEFAULT_HEALTH_PATH}"
 environments:
 YAMLEOF
   for ENV in $ENVS; do

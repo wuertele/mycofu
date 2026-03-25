@@ -509,9 +509,7 @@ applications:
   #   disk_size: 4
   #   data_disk_size: 20
   #   backup: true            # Has precious state (time-series data)
-  #   monitor: true
-  #   health_port: 8086
-  #   health_path: "/health"
+  #   monitor: true           # Health check defined in framework/catalog/influxdb/health.yaml
   #   proxmox_metrics: true   # Configure Proxmox nodes to send metrics here
   #   environments:
   #     prod:
@@ -530,9 +528,7 @@ applications:
   #   disk_size: 4
   #   data_disk_size: 4
   #   backup: false           # Dashboards can be provisioned from Git
-  #   monitor: true
-  #   health_port: 3000
-  #   health_path: "/api/health"
+  #   monitor: true           # Health check defined in framework/catalog/grafana/health.yaml
   #   environments:
   #     prod:
   #       vmid: 602

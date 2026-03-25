@@ -301,12 +301,17 @@ for ENV in "${ENVS[@]}"; do
   fi
 
   # Catalog applications (from config.yaml applications block)
+  # Health port/path come from the catalog module's metadata.yaml, not config.yaml.
   APP_NAMES=$(yq -r '.applications // {} | to_entries[] | select(.value.enabled == true and .value.monitor == true) | .key' "$CONFIG" 2>/dev/null || true)
   for APP in $APP_NAMES; do
     APP_IP=$(yq -r ".applications.${APP}.environments.${ENV}.ip // \"\"" "$CONFIG")
-    HEALTH_PORT_APP=$(yq -r ".applications.${APP}.health_port" "$CONFIG")
-    HEALTH_PATH_APP=$(yq -r ".applications.${APP}.health_path" "$CONFIG")
-    if [[ -n "$APP_IP" && "$APP_IP" != "null" ]]; then
+    HEALTH_FILE="${REPO_DIR}/framework/catalog/${APP}/health.yaml"
+    if [[ ! -f "$HEALTH_FILE" ]]; then
+      continue
+    fi
+    HEALTH_PORT_APP=$(yq -r '.port // ""' "$HEALTH_FILE")
+    HEALTH_PATH_APP=$(yq -r '.path // ""' "$HEALTH_FILE")
+    if [[ -n "$APP_IP" && "$APP_IP" != "null" && -n "$HEALTH_PORT_APP" && "$HEALTH_PORT_APP" != "null" ]]; then
       check "${APP}-${ENV} healthy (${HEALTH_PATH_APP})" \
         bash -c "curl -sfk https://${APP_IP}:${HEALTH_PORT_APP}${HEALTH_PATH_APP} >/dev/null"
     fi

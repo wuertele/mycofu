@@ -179,11 +179,13 @@ EOF
 fi
 
 # --- Catalog Application Health (from config.yaml applications block) ---
+# Health port/path come from the catalog module's metadata.yaml, not config.yaml.
 APP_NAMES=$(yq -r '.applications // {} | to_entries[] | select(.value.enabled == true and .value.monitor == true) | .key' "$CONFIG" 2>/dev/null || true)
 for APP in $APP_NAMES; do
   APP_IP=$(yq -r ".applications.${APP}.environments.prod.ip // \"\"" "$CONFIG")
-  HEALTH_PORT_APP=$(yq -r ".applications.${APP}.health_port" "$CONFIG")
-  HEALTH_PATH_APP=$(yq -r ".applications.${APP}.health_path" "$CONFIG")
+  HEALTH_FILE="${REPO_DIR}/framework/catalog/${APP}/health.yaml"
+  HEALTH_PORT_APP=$(yq -r '.port // ""' "$HEALTH_FILE" 2>/dev/null)
+  HEALTH_PATH_APP=$(yq -r '.path // ""' "$HEALTH_FILE" 2>/dev/null)
   if [[ -n "$APP_IP" && "$APP_IP" != "null" ]]; then
     cat <<EOF
   # --- ${APP} Health ---
