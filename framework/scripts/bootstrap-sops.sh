@@ -115,9 +115,19 @@ echo ""
 PDNS_API_KEY=$(openssl rand -hex 32)
 echo "PowerDNS API key auto-generated."
 
-# Read from config.yaml
-SSH_PUBKEY=$(yaml_read '.operator_ssh_pubkey' "$CONFIG")
-echo "SSH public key read from config.yaml."
+# Generate CI SSH keypair (separate from operator's workstation key).
+# The CI private key goes to the runner for node access.
+# The CI public key is installed on nodes and VMs alongside the operator key.
+CI_KEY_DIR=$(mktemp -d)
+ssh-keygen -t ed25519 -N "" -C "ci-runner" -f "${CI_KEY_DIR}/ci_key" -q
+SSH_PRIVKEY=$(cat "${CI_KEY_DIR}/ci_key")
+SSH_PUBKEY=$(cat "${CI_KEY_DIR}/ci_key.pub")
+rm -rf "$CI_KEY_DIR"
+echo "CI SSH keypair auto-generated."
+
+# Read operator public key from config.yaml
+OPERATOR_SSH_PUBKEY=$(yaml_read '.operator_ssh_pubkey' "$CONFIG")
+echo "Operator SSH public key read from config.yaml."
 
 # --- 5. Create encrypted secrets file ---
 export SOPS_AGE_KEY_FILE="$KEY_FILE"
@@ -129,6 +139,9 @@ proxmox_api_password: $PROXMOX_PASS
 pdns_api_key: $PDNS_API_KEY
 tofu_db_password: $TF_DB_PASS
 ssh_pubkey: $SSH_PUBKEY
+ssh_privkey: |
+$(echo "$SSH_PRIVKEY" | sed 's/^/  /')
+operator_ssh_pubkey: $OPERATOR_SSH_PUBKEY
 vault_unseal_keys: []
 EOF
 

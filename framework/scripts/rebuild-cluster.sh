@@ -941,7 +941,8 @@ step_start 14 "Register runner"
 
 # CI runner SSH key is now installed on nodes during step 1
 # (configure-node-network.sh installs both operator and SOPS keys).
-# No separate key installation needed here.
+# The runner's ssh config sets StrictHostKeyChecking=accept-new, so
+# known_hosts is populated automatically on first connection.
 step_done 14 "Runner registered"
 else
   step_skip 14 "Runner registration (not in scope)"
