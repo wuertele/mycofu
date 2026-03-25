@@ -324,6 +324,21 @@ start_builder_vm() {
     return 0
   fi
 
+  # Pre-create store.img at configured size if it doesn't exist or is
+  # undersized. The builder VM formats this raw file as its nix store
+  # overlay on first boot. Default is ~800MB, too small for large closures
+  # like GitLab (~6.4GB). Pre-creating at the configured size (sparse file)
+  # ensures the VM gets a full-sized store.
+  local store_img="${BUILDER_DIR}/store.img"
+  local want_bytes=$(( STORE_GB * 1024 * 1024 * 1024 ))
+  local cur_bytes
+  cur_bytes=$(stat -f%z "$store_img" 2>/dev/null || echo 0)
+  if [[ "$cur_bytes" -lt "$want_bytes" ]]; then
+    echo "  Pre-creating store overlay (${STORE_GB}GB sparse)..."
+    rm -f "$store_img"
+    dd if=/dev/zero of="$store_img" bs=1 count=0 seek=$want_bytes 2>/dev/null
+  fi
+
   echo "  Starting builder VM via ${START_SCRIPT}..."
   echo "  (First run downloads the VM image — this may take a few minutes)"
   bash "$START_SCRIPT"
@@ -336,10 +351,6 @@ start_builder_vm() {
       local pid
       pid=$(find_builder_pid)
       echo "  ✓ linux-builder VM is running (pid ${pid:-unknown})"
-      # Check if store overlay needs resizing. The linux-builder creates a
-      # default ~800MB store.img which is too small for large closures.
-      # Resize offline: stop builder, expand file, resize2fs, restart.
-      ensure_store_overlay_size
       return 0
     fi
     (( attempts++ ))
@@ -348,76 +359,6 @@ start_builder_vm() {
 
   echo "  ✗ Timed out waiting for linux-builder VM (120s)"
   echo "  Check ${BUILDER_DIR}/builder.log for errors"
-  return 1
-}
-
-# Ensure store overlay is at the configured size. If undersized, stop the
-# builder, expand the raw file, resize the ext4 filesystem offline (no SSH
-# needed), and restart. This handles both first-boot (builder creates default
-# ~800MB) and overlay reset (build-all-images.sh deletes and recreates).
-ensure_store_overlay_size() {
-  local store_img="${BUILDER_DIR}/store.img"
-  if [[ ! -f "$store_img" ]]; then
-    return 0
-  fi
-
-  local want_bytes=$(( STORE_GB * 1024 * 1024 * 1024 ))
-  local cur_bytes
-  cur_bytes=$(stat -f%z "$store_img" 2>/dev/null || echo 0)
-
-  if [[ "$cur_bytes" -ge "$want_bytes" ]]; then
-    return 0
-  fi
-
-  echo "  Store overlay is $(( cur_bytes / 1024 / 1024 ))MB, need ${STORE_GB}GB"
-  echo "  Stopping builder for offline resize..."
-  stop_builder_vm
-
-  # Expand the raw file
-  echo "  Expanding raw file to ${STORE_GB}GB..."
-  dd if=/dev/zero of="$store_img" bs=1 count=0 seek=$want_bytes 2>/dev/null
-
-  # Resize the ext4 filesystem offline using e2fsprogs from nix.
-  # This runs on the host — no SSH, no permissions issues.
-  echo "  Resizing ext4 filesystem..."
-  local e2fs_bin
-  e2fs_bin=$(nix build nixpkgs#e2fsprogs --no-link --print-out-paths 2>/dev/null | head -1)
-  if [[ -x "${e2fs_bin}/bin/resize2fs" ]]; then
-    "${e2fs_bin}/bin/e2fsck" -fy "$store_img" >/dev/null 2>&1 || true
-    if "${e2fs_bin}/bin/resize2fs" "$store_img" >/dev/null 2>&1; then
-      echo "  ✓ Store overlay resized to ${STORE_GB}GB"
-    else
-      echo "  ⚠ resize2fs failed — deleting store.img for fresh creation"
-      rm -f "$store_img"
-    fi
-  else
-    echo "  ⚠ e2fsprogs not available — deleting store.img for fresh creation"
-    rm -f "$store_img"
-  fi
-
-  # Restart the builder
-  echo "  Restarting builder..."
-  bash "$START_SCRIPT"
-  local restart_attempts=0
-  while (( restart_attempts < 60 )); do
-    if check_builder_running; then
-      local pid
-      pid=$(find_builder_pid)
-      echo "  ✓ Builder restarted (pid ${pid:-unknown})"
-
-      # If we deleted store.img above, the builder recreated it at default
-      # size. Recurse once to resize the new file.
-      local new_bytes
-      new_bytes=$(stat -f%z "$store_img" 2>/dev/null || echo 0)
-      if [[ "$new_bytes" -lt "$want_bytes" ]]; then
-        ensure_store_overlay_size
-      fi
-      return 0
-    fi
-    (( restart_attempts++ ))
-    sleep 2
-  done
-  echo "  ✗ Builder failed to restart after resize"
   return 1
 }
 

@@ -153,6 +153,10 @@ reset_builder_overlay() {
       sleep 1
     done
     rm -f "$overlay"
+    # Pre-create at configured size before restarting
+    local store_gb
+    store_gb=$(yq '.nix_builder.store_gb // 20' "${REPO_DIR}/site/config.yaml" 2>/dev/null || echo 20)
+    dd if=/dev/zero of="$overlay" bs=1 count=0 seek=$(( store_gb * 1024 * 1024 * 1024 )) 2>/dev/null
     BUILDER_START="${HOME}/.nix-builder/start-builder.sh"
     if [[ -x "$BUILDER_START" ]]; then
       bash "$BUILDER_START"
@@ -160,32 +164,6 @@ reset_builder_overlay() {
         nc -z localhost 31022 2>/dev/null && break
         sleep 5
       done
-      # Resize the new overlay to configured size (offline, no SSH)
-      local store_gb
-      store_gb=$(yq '.nix_builder.store_gb // 20' "${REPO_DIR}/site/config.yaml" 2>/dev/null || echo 20)
-      local want_bytes=$(( store_gb * 1024 * 1024 * 1024 ))
-      local cur_bytes
-      cur_bytes=$(stat -f%z "$overlay" 2>/dev/null || echo 0)
-      if [[ "$cur_bytes" -lt "$want_bytes" ]]; then
-        echo "  Resizing store overlay to ${store_gb}GB..."
-        pkill -f "qemu.*nixos.qcow2" 2>/dev/null || true
-        for i in $(seq 1 15); do
-          pgrep -f "qemu.*nixos.qcow2" >/dev/null 2>&1 || break
-          sleep 1
-        done
-        dd if=/dev/zero of="$overlay" bs=1 count=0 seek=$want_bytes 2>/dev/null
-        local e2fs_bin
-        e2fs_bin=$(nix build nixpkgs#e2fsprogs --no-link --print-out-paths 2>/dev/null | head -1)
-        if [[ -x "${e2fs_bin}/bin/resize2fs" ]]; then
-          "${e2fs_bin}/bin/e2fsck" -fy "$overlay" >/dev/null 2>&1 || true
-          "${e2fs_bin}/bin/resize2fs" "$overlay" >/dev/null 2>&1 || true
-        fi
-        bash "$BUILDER_START"
-        for i in $(seq 1 24); do
-          nc -z localhost 31022 2>/dev/null && break
-          sleep 5
-        done
-      fi
     fi
   fi
 }
