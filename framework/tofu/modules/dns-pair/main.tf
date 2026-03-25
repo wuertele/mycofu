@@ -40,7 +40,6 @@ module "dns1" {
   # DNS VMs: 256MB RAM, 4GB OS disk, no data disk, HA enabled
   ram_mb      = 256
   cores       = 1
-  vda_size_gb = 4
   vdb_size_gb = 0
   ha_enabled  = true
 
@@ -111,7 +110,6 @@ module "dns2" {
 
   ram_mb      = 256
   cores       = 1
-  vda_size_gb = 4
   vdb_size_gb = 0
   ha_enabled  = true
 

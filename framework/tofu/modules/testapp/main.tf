@@ -35,7 +35,6 @@ module "testapp" {
 
   ram_mb      = 256
   cores       = 1
-  vda_size_gb = 4
   vdb_size_gb = 1
   ha_enabled  = true
 

@@ -36,7 +36,6 @@ module "vault" {
   # Vault: 512MB RAM, 4GB OS disk, 10GB data disk (Raft), HA enabled
   ram_mb      = 512
   cores       = 1
-  vda_size_gb = 4
   vdb_size_gb = var.vdb_size_gb
   ha_enabled  = true
 

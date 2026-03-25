@@ -52,9 +52,9 @@ variable "cores" {
 }
 
 variable "vda_size_gb" {
-  description = "OS disk size in GB"
+  description = "OS disk size in GB (must be >= image virtual size)"
   type        = number
-  default     = 8
+  default     = 16
 }
 
 variable "vdb_size_gb" {

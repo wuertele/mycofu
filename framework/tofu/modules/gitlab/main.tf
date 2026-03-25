@@ -36,7 +36,6 @@ module "gitlab" {
   # GitLab: 6GB RAM, 2 cores, 12GB OS disk, 50GB data disk, HA enabled
   ram_mb      = var.ram_mb
   cores       = var.cores
-  vda_size_gb = 12
   vdb_size_gb = var.vdb_size_gb
   ha_enabled  = true
 
