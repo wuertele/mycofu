@@ -211,6 +211,8 @@ for ROLE in $ALL_ROLES; do
   system.stateVersion = "24.11";
 }
 NIXEOF
+      # Nix flake requires new files to be git-tracked before evaluation
+      git -C "${REPO_DIR}" add "${HOST_CONFIG}" 2>/dev/null || true
     fi
 
     echo ""
