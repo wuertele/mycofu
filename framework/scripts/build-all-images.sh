@@ -160,6 +160,17 @@ reset_builder_overlay() {
         nc -z localhost 31022 2>/dev/null && break
         sleep 5
       done
+      # Expand store overlay after builder recreates it at default size
+      local store_gb
+      store_gb=$(yq '.nix_builder.store_gb // 20' "${REPO_DIR}/site/config.yaml" 2>/dev/null || echo 20)
+      local want_bytes=$(( store_gb * 1024 * 1024 * 1024 ))
+      local cur_bytes
+      cur_bytes=$(stat -f%z "$overlay" 2>/dev/null || echo 0)
+      if [[ "$cur_bytes" -lt "$want_bytes" ]]; then
+        dd if=/dev/zero of="$overlay" bs=1 count=0 seek=$want_bytes 2>/dev/null
+        ssh -n -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+          -p 31022 builder@localhost "sudo resize2fs /dev/vdb" 2>/dev/null || true
+      fi
     fi
   fi
 }

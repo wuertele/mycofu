@@ -298,20 +298,6 @@ for p in /nix/var/nix/profiles/default/bin "\$HOME/.nix-profile/bin"; do
   [[ -d "\$p" ]] && export PATH="\$p:\$PATH"
 done
 
-# Pre-create store overlay at configured size if it doesn't exist.
-# The linux-builder VM formats this as ext4 on first boot.
-# Default nix linux-builder creates a tiny (~800MB) image that overflows
-# on large closures (GitLab ~6.4GB). Pre-creating at ${STORE_GB}GB ensures
-# enough space for cold-start builds.
-STORE_IMG=~/.nix-builder/store.img
-STORE_WANT_BYTES=\$((${STORE_GB} * 1024 * 1024 * 1024))
-STORE_CUR_BYTES=\$(stat -f%z "\$STORE_IMG" 2>/dev/null || echo 0)
-if [[ "\$STORE_CUR_BYTES" -lt "\$STORE_WANT_BYTES" ]]; then
-  echo "Creating \${STORE_IMG} (${STORE_GB}GB sparse)..."
-  rm -f "\$STORE_IMG"
-  dd if=/dev/zero of="\$STORE_IMG" bs=1 count=0 seek=\$STORE_WANT_BYTES 2>/dev/null
-fi
-
 nix run nixpkgs#darwin.linux-builder >> ~/.nix-builder/builder.log 2>&1 &
 disown
 STARTEOF
@@ -350,6 +336,31 @@ start_builder_vm() {
       local pid
       pid=$(find_builder_pid)
       echo "  ✓ linux-builder VM is running (pid ${pid:-unknown})"
+      # Expand store overlay if undersized. The linux-builder creates a
+      # default ~800MB store.img. We expand it to the configured size,
+      # then SSH into the builder to resize the ext4 filesystem.
+      local store_img="${BUILDER_DIR}/store.img"
+      local want_bytes=$(( STORE_GB * 1024 * 1024 * 1024 ))
+      local cur_bytes
+      cur_bytes=$(stat -f%z "$store_img" 2>/dev/null || echo 0)
+      if [[ "$cur_bytes" -lt "$want_bytes" ]]; then
+        echo "  Expanding store overlay to ${STORE_GB}GB..."
+        dd if=/dev/zero of="$store_img" bs=1 count=0 seek=$want_bytes 2>/dev/null
+        # Wait for SSH to be ready, then resize filesystem inside VM
+        local ssh_attempts=0
+        while (( ssh_attempts < 30 )); do
+          if nc -z localhost "${BUILDER_PORT}" 2>/dev/null; then
+            ssh -n -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+              -p "${BUILDER_PORT}" builder@localhost \
+              "sudo resize2fs /dev/vdb" 2>/dev/null && \
+              echo "  ✓ Store overlay expanded to ${STORE_GB}GB" || \
+              echo "  ⚠ resize2fs failed — store may still be undersized"
+            break
+          fi
+          (( ssh_attempts++ ))
+          sleep 2
+        done
+      fi
       return 0
     fi
     (( attempts++ ))
