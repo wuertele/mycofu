@@ -174,8 +174,12 @@ reset_builder_overlay() {
           sleep 1
         done
         dd if=/dev/zero of="$overlay" bs=1 count=0 seek=$want_bytes 2>/dev/null
-        nix run nixpkgs#e2fsprogs -- e2fsck -fy "$overlay" 2>/dev/null || true
-        nix run nixpkgs#e2fsprogs -- resize2fs "$overlay" 2>/dev/null || true
+        local e2fs_bin
+        e2fs_bin=$(nix build nixpkgs#e2fsprogs --no-link --print-out-paths 2>/dev/null | head -1)
+        if [[ -x "${e2fs_bin}/bin/resize2fs" ]]; then
+          "${e2fs_bin}/bin/e2fsck" -fy "$overlay" >/dev/null 2>&1 || true
+          "${e2fs_bin}/bin/resize2fs" "$overlay" >/dev/null 2>&1 || true
+        fi
         bash "$BUILDER_START"
         for i in $(seq 1 24); do
           nc -z localhost 31022 2>/dev/null && break

@@ -380,11 +380,18 @@ ensure_store_overlay_size() {
   # Resize the ext4 filesystem offline using e2fsprogs from nix.
   # This runs on the host — no SSH, no permissions issues.
   echo "  Resizing ext4 filesystem..."
-  if nix run nixpkgs#e2fsprogs -- e2fsck -fy "$store_img" 2>/dev/null && \
-     nix run nixpkgs#e2fsprogs -- resize2fs "$store_img" 2>/dev/null; then
-    echo "  ✓ Store overlay resized to ${STORE_GB}GB"
+  local e2fs_bin
+  e2fs_bin=$(nix build nixpkgs#e2fsprogs --no-link --print-out-paths 2>/dev/null | head -1)
+  if [[ -x "${e2fs_bin}/bin/resize2fs" ]]; then
+    "${e2fs_bin}/bin/e2fsck" -fy "$store_img" >/dev/null 2>&1 || true
+    if "${e2fs_bin}/bin/resize2fs" "$store_img" >/dev/null 2>&1; then
+      echo "  ✓ Store overlay resized to ${STORE_GB}GB"
+    else
+      echo "  ⚠ resize2fs failed — deleting store.img for fresh creation"
+      rm -f "$store_img"
+    fi
   else
-    echo "  ⚠ resize2fs failed — deleting store.img for fresh creation"
+    echo "  ⚠ e2fsprogs not available — deleting store.img for fresh creation"
     rm -f "$store_img"
   fi
 
