@@ -56,6 +56,7 @@ BUILDER_TYPE=$(yq '.nix_builder.type // "linux-builder"' "$CONFIG_PATH")
 CPUS=$(yq '.nix_builder.cpus // 8' "$CONFIG_PATH")
 MEMORY_GB=$(yq '.nix_builder.memory_gb // 24' "$CONFIG_PATH")
 MEMORY_MB=$((MEMORY_GB * 1024))
+STORE_GB=$(yq '.nix_builder.store_gb // 20' "$CONFIG_PATH")
 
 # Remote builder settings (only used when type: remote)
 REMOTE_HOST=$(yq '.nix_builder.remote_host // ""' "$CONFIG_PATH")
@@ -287,6 +288,7 @@ write_start_script() {
 # Resource settings from site/config.yaml (${timestamp})
 #   cpus: ${CPUS}
 #   memory_gb: ${MEMORY_GB} (${MEMORY_MB}MB)
+#   store_gb: ${STORE_GB}
 export TMPDIR=~/.nix-builder
 export USE_TMPDIR=1
 export QEMU_OPTS="-smp ${CPUS} -m ${MEMORY_MB}"
@@ -295,6 +297,17 @@ export QEMU_OPTS="-smp ${CPUS} -m ${MEMORY_MB}"
 for p in /nix/var/nix/profiles/default/bin "\$HOME/.nix-profile/bin"; do
   [[ -d "\$p" ]] && export PATH="\$p:\$PATH"
 done
+
+# Pre-create store overlay at configured size if it doesn't exist.
+# The linux-builder VM formats this as ext4 on first boot.
+# Default nix linux-builder creates a tiny (~800MB) image that overflows
+# on large closures (GitLab ~6.4GB). Pre-creating at ${STORE_GB}GB ensures
+# enough space for cold-start builds.
+STORE_IMG=~/.nix-builder/store.img
+if [[ ! -f "\$STORE_IMG" ]]; then
+  echo "Creating \${STORE_IMG} (${STORE_GB}GB sparse)..."
+  dd if=/dev/zero of="\$STORE_IMG" bs=1 count=0 seek=\$((${STORE_GB} * 1024 * 1024 * 1024)) 2>/dev/null
+fi
 
 nix run nixpkgs#darwin.linux-builder >> ~/.nix-builder/builder.log 2>&1 &
 disown
