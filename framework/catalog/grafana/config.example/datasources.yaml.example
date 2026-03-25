@@ -2,7 +2,7 @@
 #
 # See: https://grafana.com/docs/grafana/latest/administration/provisioning/#data-sources
 #
-# IMPORTANT: Replace CHANGEME values with your actual configuration.
+# IMPORTANT: Replace placeholder values below with your actual configuration.
 #
 # The InfluxDB URL uses the unqualified hostname 'influxdb'. In prod,
 # this resolves to the prod InfluxDB. In dev, to the dev InfluxDB.
