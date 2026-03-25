@@ -461,7 +461,7 @@ nix_builder:
   # Set these to match your workstation's available resources.
   cpus: 8                             # OPTIONAL: default 8
   memory_gb: 24                        # OPTIONAL: default 24
-  store_gb: 20                          # OPTIONAL: overlay store size in GB (default 20)
+  store_gb: 40                          # OPTIONAL: builder VM disk size in GB (default 40)
 
 # --- PBS (Proxmox Backup Server) ---
 # Proxmox Backup Server is a vendor appliance (official Proxmox ISO, not NixOS).

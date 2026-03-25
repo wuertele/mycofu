@@ -129,12 +129,13 @@ check_store_space() {
   fi
 }
 
-# Reset the builder overlay between builds on macOS. Each build populates the
-# overlay with paths not in the host store. After a large build (gitlab ~6.6G),
-# the overlay may be full. Resetting between builds ensures each build starts
-# with a fresh overlay. The host store caches successful build outputs, so
-# subsequent builds of the same role are instant (nix cache hit).
+# No-op: overlay reset is unnecessary and harmful.
+# store.img is erofs (read-only, recreated each boot) — it doesn't grow.
+# nixos.qcow2 is the writable disk; it persists and has room for all builds
+# at the configured store_gb size. Restarting the builder between builds
+# kills SSH state and wastes time.
 reset_builder_overlay() {
+  return 0
   if [[ "$(uname)" != "Darwin" ]]; then
     return 0
   fi
@@ -153,10 +154,8 @@ reset_builder_overlay() {
       sleep 1
     done
     rm -f "$overlay"
-    # Pre-create at configured size before restarting
-    local store_gb
-    store_gb=$(yq '.nix_builder.store_gb // 20' "${REPO_DIR}/site/config.yaml" 2>/dev/null || echo 20)
-    dd if=/dev/zero of="$overlay" bs=1 count=0 seek=$(( store_gb * 1024 * 1024 * 1024 )) 2>/dev/null
+    # store.img is erofs — recreated by run-nixos-vm on each start.
+    # No pre-create needed. Just restart the builder.
     BUILDER_START="${HOME}/.nix-builder/start-builder.sh"
     if [[ -x "$BUILDER_START" ]]; then
       bash "$BUILDER_START"

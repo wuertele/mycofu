@@ -63,7 +63,11 @@
         dns-image     = mkImage [ "${nixSrc}/site/nix/hosts/dns.nix" ];
         pebble-image  = mkImage [ "${nixSrc}/site/nix/hosts/pebble.nix" ];
         vault-image   = mkImage [ "${nixSrc}/site/nix/hosts/vault.nix" ];
-        gitlab-image  = mkImage [ "${nixSrc}/site/nix/hosts/gitlab.nix" ];
+        gitlab-image  = import "${nixSrc}/framework/nix/lib/make-image.nix" {
+          inherit nixpkgs system extraSpecialArgs;
+          modules = [ "${nixSrc}/site/nix/hosts/gitlab.nix" ];
+          diskSize = "10240";  # 10GB — gitlab closure is ~6.4GB, auto+2GB isn't enough
+        };
         cicd-image    = mkImage [ "${nixSrc}/site/nix/hosts/cicd.nix" ];
         gatus-image   = mkImage [ "${nixSrc}/site/nix/hosts/gatus.nix" ];
         testapp-image = mkImage [ "${nixSrc}/site/nix/hosts/testapp.nix" ];
