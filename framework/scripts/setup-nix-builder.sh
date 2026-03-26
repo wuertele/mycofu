@@ -302,6 +302,13 @@ for p in /nix/var/nix/profiles/default/bin "$HOME/.nix-profile/bin"; do
   [[ -d "$p" ]] && export PATH="$p:$PATH"
 done
 
+# Ensure certs directory is writable. run-nixos-vm copies the SSL cert
+# file here on every start. If a previous run left it read-only, the
+# copy fails and the builder can't start.
+mkdir -p ~/.nix-builder/certs
+chmod 755 ~/.nix-builder/certs
+chmod 644 ~/.nix-builder/certs/ca-certificates.crt 2>/dev/null || true
+
 # Resolve the linux-builder derivation and extract script paths.
 BUILDER_DRV=$(nix build nixpkgs#darwin.linux-builder --no-link --print-out-paths 2>/dev/null | head -1)
 if [[ -z "$BUILDER_DRV" ]]; then
