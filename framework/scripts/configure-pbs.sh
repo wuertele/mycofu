@@ -358,18 +358,18 @@ if pbs_ssh_key "proxmox-backup-manager datastore list --output-format json" \
   if pbs_ssh_key "test -d ${DATASTORE_MOUNT}/.chunks" 2>/dev/null; then
     echo "  Datastore '${DATASTORE_NAME}' already exists — verified functional"
   else
-    echo "  ERROR: Datastore '${DATASTORE_NAME}' is configured but .chunks is missing." >&2
-    echo "  The datastore filesystem is broken. Backups will fail." >&2
-    echo "" >&2
-    echo "  To fix, SSH to PBS and either:" >&2
-    echo "    a) Clear the datastore and recreate (if the data is expendable):" >&2
-    echo "       ssh root@${PBS_IP} 'proxmox-backup-manager datastore remove ${DATASTORE_NAME}'" >&2
-    echo "       ssh root@${PBS_IP} 'rm -rf ${DATASTORE_MOUNT}/*; rm -rf ${DATASTORE_MOUNT}/.*'" >&2
-    echo "       ssh root@${PBS_IP} 'proxmox-backup-manager datastore create ${DATASTORE_NAME} ${DATASTORE_MOUNT}'" >&2
-    echo "    b) Investigate whether the data is recoverable (if precious)" >&2
-    echo "" >&2
-    echo "  Then re-run this script." >&2
-    exit 1
+    echo "  Datastore '${DATASTORE_NAME}' is configured but .chunks is missing — recreating..."
+    pbs_ssh_key "proxmox-backup-manager datastore remove ${DATASTORE_NAME}" 2>/dev/null || true
+    sleep 2
+    # Clean the mount point (Synology leaves #recycle and @eaDir)
+    pbs_ssh_key "find ${DATASTORE_MOUNT} -mindepth 1 -delete 2>/dev/null || true"
+    pbs_ssh_key "proxmox-backup-manager datastore create ${DATASTORE_NAME} ${DATASTORE_MOUNT}" 2>&1
+    if pbs_ssh_key "test -d ${DATASTORE_MOUNT}/.chunks" 2>/dev/null; then
+      echo "  Datastore recreated successfully"
+    else
+      echo "  ERROR: Failed to recreate datastore" >&2
+      exit 1
+    fi
   fi
 else
   echo "  Creating datastore '${DATASTORE_NAME}' at ${DATASTORE_MOUNT}..."
