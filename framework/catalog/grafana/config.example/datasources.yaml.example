@@ -22,8 +22,8 @@ datasources:
     url: https://influxdb:8086
     jsonData:
       version: Flux
-      organization: CHANGEME
-      defaultBucket: CHANGEME
+      organization: homelab
+      defaultBucket: default
       tlsSkipVerify: true
     secureJsonData:
       token: ${INFLUXDB_TOKEN}
