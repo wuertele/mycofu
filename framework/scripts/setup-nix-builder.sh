@@ -302,25 +302,23 @@ for p in /nix/var/nix/profiles/default/bin "$HOME/.nix-profile/bin"; do
   [[ -d "$p" ]] && export PATH="$p:$PATH"
 done
 
-# Start only the QEMU VM, not key installation.
-# Key installation (add-keys) requires sudo with a terminal and is
-# handled by setup-nix-builder.sh before this script runs.
+# Resolve the linux-builder derivation and extract script paths.
 BUILDER_DRV=$(nix build nixpkgs#darwin.linux-builder --no-link --print-out-paths 2>/dev/null | head -1)
 if [[ -z "$BUILDER_DRV" ]]; then
   echo "ERROR: Failed to resolve nixpkgs#darwin.linux-builder" >&2
   exit 1
 fi
 CREATE_SCRIPT="${BUILDER_DRV}/bin/create-builder"
-RUN_BUILDER=$(grep 'run-builder/bin/run-builder' "$CREATE_SCRIPT" | head -1 | tr -d ' ')
+ADD_KEYS=$(grep -o '/nix/store/[^ ]*add-keys/bin/add-keys' "$CREATE_SCRIPT" | head -1)
+RUN_BUILDER=$(grep -o '/nix/store/[^ ]*run-builder/bin/run-builder' "$CREATE_SCRIPT" | head -1)
+RUN_VM=$(grep -o '/nix/store/[^ ]*run-nixos-vm' "$RUN_BUILDER" | head -1)
 
-# Pin NIX_DISK_IMAGE to ~/.nix-builder/ so it doesn't land in CWD.
+# Pin disk image to ~/.nix-builder/ so it doesn't land in CWD.
 export NIX_DISK_IMAGE=~/.nix-builder/nixos.qcow2
 
-# Patch run-nixos-vm to use configured disk size instead of the hardcoded 20GB.
-# The default 20GB overflows for gitlab (~6.4GB closure + 10GB image file).
-# We copy the script and sed the size. The patched copy is stable across
-# builder restarts (only regenerated when setup-nix-builder.sh runs).
-RUN_VM=$(grep -o '/nix/store/[^ ]*run-nixos-vm' "$RUN_BUILDER" | head -1)
+# Patch run-nixos-vm to use configured disk size instead of the
+# hardcoded 20GB. The builder's writable disk accumulates build outputs;
+# 20GB fills after ~4 images on a cold host store.
 PATCHED_VM=~/.nix-builder/run-nixos-vm-patched
 if [[ -x "$RUN_VM" ]]; then
   rm -f "$PATCHED_VM"
@@ -330,20 +328,21 @@ if [[ -x "$RUN_VM" ]]; then
   chmod +x "$PATCHED_VM"
 fi
 
-# Create a patched run-builder that uses our patched run-nixos-vm
+# Create a patched run-builder that uses our patched run-nixos-vm.
 PATCHED_BUILDER=~/.nix-builder/run-builder-patched
 rm -f "$PATCHED_BUILDER"
 cp "$RUN_BUILDER" "$PATCHED_BUILDER"
 sed -i '' "s|$RUN_VM|$PATCHED_VM|" "$PATCHED_BUILDER"
 chmod +x "$PATCHED_BUILDER"
 
-if [[ -x "$PATCHED_BUILDER" ]]; then
-  KEYS=~/.nix-builder/keys "$PATCHED_BUILDER" >> ~/.nix-builder/builder.log 2>&1 &
-  disown
-else
-  echo "ERROR: run-builder not found in ${CREATE_SCRIPT}" >&2
-  exit 1
-fi
+# Run add-keys (checks for existing keys, skips sudo if they match
+# /etc/nix/) then start the patched builder. This is the same sequence
+# as create-builder but with the patched run-builder.
+export KEYS=~/.nix-builder/keys
+cd ~/.nix-builder
+"$ADD_KEYS"
+"$PATCHED_BUILDER" >> ~/.nix-builder/builder.log 2>&1 &
+disown
 STARTEOF
   chmod +x "$START_SCRIPT"
   echo "  ✓ ${START_SCRIPT} written (cpus=${CPUS}, memory=${MEMORY_GB}GB)"
@@ -571,21 +570,9 @@ SSHEOF
   echo ""
   echo "--- linux-builder VM ---"
 
-  # Install builder SSH keys (requires sudo — interactive terminal needed).
-  # Keys go to ~/.nix-builder/keys/ where run-builder picks them up.
-  # This only runs during full setup, not --start (which may be non-interactive).
-  echo "  Installing builder SSH keys..."
-  local builder_drv
-  builder_drv=$(nix build nixpkgs#darwin.linux-builder --no-link --print-out-paths 2>/dev/null | head -1)
-  if [[ -n "$builder_drv" ]]; then
-    local create_script="${builder_drv}/bin/create-builder"
-    local add_keys
-    add_keys=$(grep 'add-keys/bin/add-keys' "$create_script" 2>/dev/null | head -1 | tr -d ' ')
-    if [[ -x "$add_keys" ]]; then
-      (cd "${BUILDER_DIR}" && "$add_keys")
-    fi
-  fi
-
+  # SSH key installation is handled by the start script (add-keys runs
+  # before run-builder on every start). On first run, sudo is needed.
+  # On subsequent starts, keys match /etc/nix/ and sudo is skipped.
   if ! start_builder_vm; then
     return 1
   fi

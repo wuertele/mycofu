@@ -157,52 +157,43 @@ check_store_space() {
   fi
 }
 
-# No-op: overlay reset is unnecessary and harmful.
-# store.img is erofs (read-only, recreated each boot) — it doesn't grow.
-# nixos.qcow2 is the writable disk; it persists and has room for all builds
-# at the configured store_gb size. Restarting the builder between builds
-# kills SSH state and wastes time.
+# Reset the builder VM between builds on macOS. Each build accumulates
+# outputs in the builder's writable disk (nixos.qcow2). Without reset,
+# the disk fills after ~4 large images. Restarting the VM with a fresh
+# nixos.qcow2 reclaims all space. The erofs store.img (read-only nix
+# closure) is recreated automatically on each boot from the host store.
+# SSH keys in ~/.nix-builder/keys/ persist across restarts.
 reset_builder_overlay() {
-  return 0
   if [[ "$(uname)" != "Darwin" ]]; then
     return 0
   fi
-  local overlay="${HOME}/.nix-builder/store.img"
-  if [[ ! -f "$overlay" ]]; then
+  local qcow2="${NIX_DISK_IMAGE:-${HOME}/.nix-builder/nixos.qcow2}"
+  if [[ ! -f "$qcow2" ]]; then
     return 0
   fi
-  local overlay_size
-  overlay_size=$(du -m "$overlay" 2>/dev/null | cut -f1)
-  # Only reset if overlay > 200MB (skip if small — saves restart time)
-  if [[ "$overlay_size" -gt 200 ]]; then
-    echo "  Resetting builder overlay (${overlay_size}MB)..."
+  local disk_used
+  disk_used=$(du -m "$qcow2" 2>/dev/null | cut -f1)
+  # Only reset if disk has grown significantly (>2GB of build outputs)
+  if [[ "$disk_used" -gt 2000 ]]; then
+    echo "  Resetting builder (${disk_used}MB used)..."
     pkill -f "qemu.*nixos.qcow2" 2>/dev/null || true
     for i in $(seq 1 15); do
       pgrep -f "qemu.*nixos.qcow2" >/dev/null 2>&1 || break
       sleep 1
     done
-    rm -f "$overlay"
-    # store.img is erofs — recreated by run-nixos-vm on each start.
-    # No pre-create needed. Just restart the builder.
+    rm -f "$qcow2"
+    rm -f "${HOME}/.nix-builder/store.img"
     BUILDER_START="${HOME}/.nix-builder/start-builder.sh"
     if [[ -x "$BUILDER_START" ]]; then
       bash "$BUILDER_START"
-      # Wait for builder SSH port (up to 180s — first boot downloads VM image)
-      local up=0
       for i in $(seq 1 36); do
         if nc -z localhost 31022 2>/dev/null; then
-          up=1
           break
         fi
         sleep 5
       done
-      if [[ "$up" -eq 0 ]]; then
-        echo "  ERROR: Builder failed to restart after overlay reset" >&2
-        return 1
-      fi
-      # Verify the builder actually works
-      if ! nix build nixpkgs#hello --no-link 2>/dev/null; then
-        echo "  ERROR: Builder restarted but test build failed" >&2
+      if ! nc -z localhost 31022 2>/dev/null; then
+        echo "  ERROR: Builder failed to restart" >&2
         return 1
       fi
     fi
