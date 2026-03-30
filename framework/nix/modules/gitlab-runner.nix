@@ -55,7 +55,8 @@ let
       --non-interactive \
       --url "$GITLAB_URL" \
       --token "$TOKEN" \
-      --executor shell
+      --executor shell \
+      --tag-list "infra,deploy"
 
     echo "Runner registered with $GITLAB_URL"
   '';

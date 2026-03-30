@@ -228,8 +228,9 @@ sleep 2
 if runner_ssh "systemctl is-active gitlab-runner" 2>/dev/null | grep -q active; then
   echo "  Runner service is active"
 else
-  echo "  WARNING: Runner service is not active"
+  echo "  ERROR: Runner service is not active" >&2
   runner_ssh "journalctl -u gitlab-runner --no-pager -n 20" 2>/dev/null || true
+  exit 1
 fi
 
 # Verify runner is online in GitLab
@@ -247,11 +248,15 @@ if [[ -n "$ROOT_PASSWORD" ]]; then
     ONLINE=$(echo "$RUNNERS" | jq -r '[.[] | select(.status == "online")] | length')
     echo "  Online runners: $ONLINE"
     echo "$RUNNERS" | jq -r '.[] | "  - ID: \(.id), Status: \(.status), Tags: \(.tag_list // [] | join(","))"'
+    if [[ "$ONLINE" -eq 0 ]]; then
+      echo "  ERROR: No runners online in GitLab — pipeline jobs will not execute" >&2
+      exit 1
+    fi
   else
-    echo "  Cannot verify (OAuth token request failed)"
+    echo "  WARNING: Cannot verify (OAuth token request failed) — runner may not be online"
   fi
 else
-  echo "  Cannot verify (no root password in SOPS)"
+  echo "  WARNING: Cannot verify (no root password in SOPS) — runner may not be online"
 fi
 
 echo ""

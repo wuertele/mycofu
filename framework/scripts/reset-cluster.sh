@@ -39,6 +39,7 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 CONFIG="${REPO_DIR}/site/config.yaml"
+APPS_CONFIG="${REPO_DIR}/site/applications.yaml"
 
 CONFIRM=0
 LEVEL=""
@@ -262,8 +263,8 @@ do_reset_vms() {
       # Application VMs with backup: true
       while IFS= read -r app_key; do
         [[ -z "$app_key" ]] && continue
-        for env in $(yq -r ".applications.${app_key}.environments | keys | .[]" "$CONFIG" 2>/dev/null); do
-          vmid=$(yq -r ".applications.${app_key}.environments.${env}.vmid" "$CONFIG")
+        for env in $(yq -r ".applications.${app_key}.environments | keys | .[]" "$APPS_CONFIG" 2>/dev/null); do
+          vmid=$(yq -r ".applications.${app_key}.environments.${env}.vmid" "$APPS_CONFIG")
           for ip in "${NODE_IPS[@]}"; do
             if ssh_node "$ip" "qm status ${vmid}" >/dev/null 2>&1; then
               echo "  ${app_key}_${env} (${vmid}) on ${ip}..."
@@ -273,7 +274,7 @@ do_reset_vms() {
             fi
           done
         done
-      done < <(yq -r '.applications | to_entries[] | select(.value.enabled == true and .value.backup == true) | .key' "$CONFIG")
+      done < <(yq -r '.applications // {} | to_entries[] | select(.value.enabled == true and .value.backup == true) | .key' "$APPS_CONFIG" 2>/dev/null)
     fi
   fi
 
@@ -685,10 +686,10 @@ do_reset_workstation() {
   for vm_ip in $(yq -r '.vms[].ip' "$CONFIG" 2>/dev/null); do
     ssh-keygen -R "$vm_ip" 2>/dev/null && cleaned=$((cleaned + 1)) || true
   done
-  for app_ip in $(yq -r '.applications[].environments[].ip // empty' "$CONFIG" 2>/dev/null); do
+  for app_ip in $(yq -r '.applications[].environments[].ip // empty' "$APPS_CONFIG" 2>/dev/null); do
     ssh-keygen -R "$app_ip" 2>/dev/null && cleaned=$((cleaned + 1)) || true
   done
-  for app_mgmt in $(yq -r '.applications[].environments[].mgmt_nic.ip // empty' "$CONFIG" 2>/dev/null); do
+  for app_mgmt in $(yq -r '.applications[].environments[].mgmt_nic.ip // empty' "$APPS_CONFIG" 2>/dev/null); do
     ssh-keygen -R "$app_mgmt" 2>/dev/null && cleaned=$((cleaned + 1)) || true
   done
   echo "  Cleaned ${cleaned} SSH known_hosts entries"

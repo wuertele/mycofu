@@ -51,89 +51,110 @@ sops -d site/sops/secrets.yaml
 
 ## Adding a New VM
 
-Every new VM follows the same pattern: define it in config.yaml, create its
-image source, add it to OpenTofu, and deploy. The specifics vary by image
-category.
+Application VMs are specified in `site/applications.yaml`. Framework VMs
+(DNS, Vault, PBS, GitLab, etc.) are in `site/config.yaml` and are not
+operator-managed in normal use.
+
+You can add an application VM in two ways — both are fully supported and
+produce identical results. The framework reads `applications.yaml` directly;
+it does not require that entries were produced by a generator.
 
 **Application secrets are auto-generated.** If your application needs a
 SOPS secret (like an admin API token), the deploy pipeline generates it
 automatically on first deploy. You do not need to run `bootstrap-sops.sh`
-or manually add tokens to SOPS. The framework checks config.yaml for
+or manually add tokens to SOPS. The framework checks `applications.yaml` for
 enabled applications, generates any missing SOPS keys, and proceeds.
 See architecture.md section 9.2 for the on-demand secret lifecycle.
 
-### Category A: NixOS VM (Recommended)
+### Using enable-app.sh (Catalog Applications)
 
-This is the default choice for any VM where you control the OS configuration.
-Full pipeline integration, content-addressed images, declarative config.
+If the application exists in `framework/catalog/`, `enable-app.sh` saves
+you from knowing every field. It allocates VMIDs, IPs, and MACs; writes a
+complete entry to `site/applications.yaml` with inline documentation; and
+generates the NixOS host config and app config stubs.
 
-**1. Add the VM to config.yaml:**
+```bash
+framework/scripts/enable-app.sh grafana
+```
+
+After it runs:
+
+1. **Review `site/applications.yaml`** — the generated entry has all
+   derivable values filled in with inline comments explaining each one.
+   Override anything that needs changing by editing directly.
+2. **Edit `site/apps/grafana/`** — replace any `CHANGEME` values in the
+   app config files.
+3. **Add secrets to SOPS** — follow the prompts in the script summary.
+4. **Add flake output** to `flake.nix`.
+5. **Deploy** via the pipeline.
+
+The script is idempotent — running it twice for the same app is safe.
+It never modifies an existing entry.
+
+Available catalog applications:
+
+```bash
+ls framework/catalog/
+```
+
+### Writing applications.yaml Directly
+
+For applications not in the catalog, or if you prefer to write entries
+by hand, add a block to `site/applications.yaml` directly. The format
+is the same regardless of how the entry was created. Then continue from
+step 2 above.
 
 ```yaml
-# In site/config.yaml → applications:
+# site/applications.yaml
 applications:
   myapp:
+    node: node1
+    ram: 2048
+    cores: 2
+    disk_size: 4
+    data_disk_size: 10
+    backup: true        # set true if this app has precious state on vdb
+    monitor: false      # set true once you add health.yaml to your catalog entry
+
     environments:
       prod:
-        ip: 10.0.10.70          # pick an unused IP in the prod subnet
-        mac: "02:aa:bb:cc:dd:ee" # see below for generation
-        node: pve01              # intended placement
+        # IP must be within prod app range — check site/config.yaml for subnet
+        # Verify no duplicate: grep 'ip:' site/config.yaml site/applications.yaml
+        ip: 10.0.10.70
+        # VMID scheme: 6xx = prod apps — check site/config.yaml for scheme
+        # Verify no duplicate: grep 'vmid:' site/config.yaml site/applications.yaml
+        vmid: 601
+        # MAC is stable across rebuilds — preserves layer 2 identity
+        mac: "02:aa:bb:cc:dd:ee"
       dev:
-        ip: 10.0.60.70
+        ip: 10.0.20.70
+        vmid: 501
         mac: "02:aa:bb:cc:dd:ff"
-        node: pve02
-    ram_mb: 2048
-    cores: 2
-    disk_gb: 20                  # vda (root)
-    data_disk_gb: 10             # vdb (data, if needed — omit if stateless)
 ```
 
-Generate unique locally-administered MACs (the `02:` prefix marks them as
-locally administered, avoiding collisions with real hardware MACs):
+To generate locally-administered MACs manually:
 
 ```bash
-# Generate one MAC
-printf '02:%02x:%02x:%02x:%02x:%02x\n' $((RANDOM%256)) $((RANDOM%256)) $((RANDOM%256)) $((RANDOM%256)) $((RANDOM%256))
-
-# Or generate a pair (prod + dev) for a new VM
-for env in prod dev; do
-  printf "  %s: \"02:%02x:%02x:%02x:%02x:%02x\"\n" "$env" $((RANDOM%256)) $((RANDOM%256)) $((RANDOM%256)) $((RANDOM%256)) $((RANDOM%256))
-done
+printf '02:%02x:%02x:%02x:%02x:%02x\n' \
+  $((RANDOM%256)) $((RANDOM%256)) $((RANDOM%256)) $((RANDOM%256)) $((RANDOM%256))
 ```
 
-Note: `new-site.sh` pre-generates MACs for all infrastructure VMs. You only
-need to generate MACs manually when adding application VMs after initial setup.
+### NixOS VM — Additional Steps
 
-**2. Create the NixOS host configuration:**
+**1. Create the NixOS host configuration** at `site/nix/hosts/myapp.nix`:
 
-```bash
-# site/nix/hosts/myapp.nix
+```nix
 { config, pkgs, lib, ... }:
 {
   imports = [
-    ../../../framework/nix/modules/base.nix       # common base (SSH, certbot, etc.)
-    ../../../framework/nix/modules/myapp.nix       # your service module
+    ../../../framework/nix/modules/base.nix
+    ../../../framework/nix/modules/myapp.nix
   ];
-
-  # Any site-specific overrides
+  # Site-specific overrides here
 }
 ```
 
-**3. Create or reuse a NixOS module:**
-
-```bash
-# framework/nix/modules/myapp.nix (if reusable across deployments)
-# OR site/nix/modules/myapp.nix (if site-specific)
-{ config, pkgs, lib, ... }:
-{
-  services.myapp = {
-    enable = true;
-    # ...
-  };
-}
-```
-
-**4. Add to the flake outputs** in `flake.nix`:
+**2. Add to the flake outputs** in `flake.nix`:
 
 ```nix
 myapp-image = mkImage {
@@ -141,11 +162,11 @@ myapp-image = mkImage {
 };
 ```
 
-**5. Update the nixSrc filter** in `flake.nix` if you added new files that the
-build references. If you don't, the build will fail with a file-not-found error
-(this is by design — see `.claude/rules/nixos.md`).
+**3. Update the nixSrc filter** in `flake.nix` if you added new files that
+the build references — otherwise the build fails with a file-not-found error
+(by design).
 
-**6. Add to the site image manifest** (`site/images.yaml`):
+**4. Add to the site image manifest** (`site/images.yaml`):
 
 ```yaml
 roles:
@@ -155,74 +176,51 @@ roles:
     flake_output: myapp-image
 ```
 
-**7. Add the OpenTofu module instantiation** in `site/tofu/main.tf`:
+**5. Add the OpenTofu module** in `site/tofu/main.tf`:
 
 ```hcl
 module "myapp_prod" {
   source = "../../framework/tofu/modules/proxmox-vm"
-  # ... standard parameters from config.yaml
+  # parameters from applications.yaml
 }
-
 module "myapp_dev" {
   source = "../../framework/tofu/modules/proxmox-vm"
-  # ... same module, dev values
 }
 ```
 
-**8. Deploy:**
+**6. Deploy:**
 
 ```bash
 git add -A && git commit -m "add myapp VM"
 git push gitlab dev
-# Pipeline builds the image, deploys to dev
-# Verify in dev, then promote to prod via MR
+# Pipeline builds image, deploys to dev. Verify, then promote to prod via MR.
 ```
 
-**9. Post-deploy (if the VM has precious state):**
-- Add PBS backup jobs via `configure-backups.sh` or update the backup
-  configuration
-- The pipeline's `post-deploy.sh` handles replication cleanup automatically
+### Non-NixOS VM (Custom Image)
 
-### Category B: Non-NixOS VM (Custom Image)
+For VMs that need a non-NixOS base (Debian, Ubuntu, vendor kernel).
 
-For VMs that need a specific non-NixOS base (Debian, Ubuntu, vendor kernel).
+Add an entry to `site/applications.yaml` as above, then:
 
-**1–2.** Same as Category A (config.yaml entry and OpenTofu module).
+1. Create a build script at `site/images/myapp/build.sh` that produces an
+   `.img` file (idempotent).
+2. Add to `site/images.yaml`:
+   ```yaml
+   roles:
+     myapp:
+       category: external
+       build_script: site/images/myapp/build.sh
+   ```
+3. Add the OpenTofu module and deploy via pipeline.
 
-**3. Create a build script** at `site/images/myapp/build.sh` that produces
-an image file. The script should be idempotent and output a single `.img` file.
-
-**4. Add to `site/images.yaml`:**
-
-```yaml
-roles:
-  myapp:
-    category: external
-    build_script: site/images/myapp/build.sh
-```
-
-**5–8.** Same as Category A (OpenTofu module, deploy via pipeline).
-
-The pipeline runs your build script, hashes the output, and names it
-`myapp-<sha256>.img`. If the hash matches the existing image, the VM is not
-recreated.
-
-### Category C: Vendor Appliance (Manual Image)
+### Vendor Appliance (Manual Image)
 
 For vendor-provided appliances (PBS, HAOS) that ship as ISOs or pre-built
 images.
 
-**1.** Add to config.yaml as above.
-
-**2.** Add the OpenTofu module in `site/tofu/main.tf`. Use the vendor image
-directly — no build pipeline.
-
-**3.** Install the appliance manually (ISO boot via Proxmox UI, or import
-a pre-built disk image).
-
-**4.** Category C VMs are Tier 2 (workstation-managed). They do not appear
-in the image manifests and are not built by the pipeline. Deploy from the
-workstation:
+Add an entry to `site/applications.yaml`. Add the OpenTofu module in
+`site/tofu/main.tf` using the vendor image directly. Install manually via
+Proxmox UI or disk import. Category C VMs are Tier 2 (workstation-managed):
 
 ```bash
 cd site/tofu
@@ -231,23 +229,23 @@ cd site/tofu
 
 ### DNS Records
 
-Adding a VM to `config.yaml → applications` (with an IP) automatically
-generates a DNS A record. OpenTofu includes the record in the DNS VM's CIDATA.
-On the next deploy, the DNS VM loads the updated zone at boot. No manual DNS
-step is needed.
+Adding a VM to `site/applications.yaml` (with an IP) automatically generates
+a DNS A record. OpenTofu includes the record in the DNS VM's CIDATA. On the
+next deploy, the DNS VM loads the updated zone at boot. No manual DNS step
+is needed.
 
 For non-VM DNS records (MX, TXT, CNAME), add them to
 `site/dns/zones/<env>.yaml` and deploy.
 
 ### Deciding on vdb (Data Disk)
 
-- **Stateless VMs** (web servers, proxies): no vdb needed. The VM is fully
-  disposable — `tofu apply` recreates it from the image.
-- **VMs with precious state** (databases, Home Assistant): add a `data_disk_gb`
-  in config.yaml. The data lives on vdb, which persists across VM recreation.
-  Add PBS backup jobs for the vdb.
+- **Stateless VMs** (web servers, proxies): omit `data_disk_size` or set to 0.
+  The VM is fully disposable — `tofu apply` recreates it from the image.
+- **VMs with precious state** (databases, Home Assistant): set `data_disk_size`
+  and `backup: true`. The data lives on vdb, which persists across VM
+  recreation and is backed up by PBS.
 - **VMs with configuration state** (category 2 data pushed from Git): vdb is
-  optional. If the config can be re-pushed on every deploy, no vdb is needed.
+  optional. If config can be re-pushed on every deploy, no vdb needed.
 
 ---
 
@@ -309,6 +307,11 @@ When `tofu apply` recreates a VM (new image hash, CIDATA change, etc.),
    token mismatch)
 5. GitLab configuration and runner registration (if GitLab was recreated)
 6. Three-gate backup validation
+
+**DR test scripts:** `framework/dr-tests/` contains test scripts for
+each recovery scenario. Run them after changes that touch backup,
+restore, or rebuild paths. See `DR-REGISTRY.md` for which tests to
+run after each type of change.
 
 For manual workstation deploys outside `rebuild-cluster.sh` (not
 recommended), the individual steps are:
@@ -545,6 +548,7 @@ protection against this scenario (see the Continuous section above).
 | Monthly | Backup restore spot-check (restore one VM's vdb to a temp VM, verify application starts) |
 | Quarterly | Prod verification drills (DNS failover, Vault restart, node evacuation) |
 | Annually | Bootstrap secret rotation (or on suspected compromise) |
+| After significant changes | Run invalidated DR tests per `framework/dr-tests/DR-REGISTRY.md` |
 
 ---
 
@@ -568,15 +572,18 @@ ssh root@<node2-ip>         # pve02
 ssh root@<node3-ip>         # pve03
 ```
 
-VM IPs are in `config.yaml → vms.*` and `config.yaml → applications.*`.
+VM IPs are in `site/config.yaml → vms.*` (framework VMs) and
+`site/applications.yaml → applications.*` (application VMs).
 
 ### When DNS Is Down
 
 Add entries to your workstation's `/etc/hosts`:
 
 ```bash
-# Generate from config.yaml
+# Framework VMs
 yq '.vms | to_entries | .[] | .value.ip + " " + .key' site/config.yaml
+# Application VMs
+yq '.applications | to_entries | .[] | .value.environments.prod.ip + " " + .key' site/applications.yaml
 ```
 
 ### Full Disaster Recovery
@@ -611,12 +618,13 @@ handles this gracefully — Vault auto-recovers from token mismatches, and
 the pre-backup gate detects empty VMs. All services initialize fresh.
 
 **What you need to recover from anything:**
-- `site/config.yaml` (in git — describes your entire infrastructure)
-- `operator.age.key` (backed up — decrypts all SOPS secrets)
-- The git repository (code + configuration + encrypted secrets)
+- The git repository (in git — contains `site/config.yaml`,
+  `site/applications.yaml`, all NixOS configs, encrypted secrets,
+  and the full framework)
+- `operator.age.key` (backed up separately — decrypts all SOPS secrets)
 - The NAS (PostgreSQL for tofu state, NFS for PBS backups) — if it survived
 
-These four things, plus bare Proxmox nodes, are sufficient for a complete
+These three things, plus bare Proxmox nodes, are sufficient for a complete
 rebuild.
 
 ---

@@ -19,6 +19,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 CONFIG="${REPO_DIR}/site/config.yaml"
+APPS_CONFIG="${REPO_DIR}/site/applications.yaml"
 SETUP_JSON="${REPO_DIR}/site/apps/influxdb/setup.json"
 
 SSH_OPTS="-n -o ConnectTimeout=10 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
@@ -26,7 +27,7 @@ SSH_OPTS="-n -o ConnectTimeout=10 -o StrictHostKeyChecking=no -o UserKnownHostsF
 SSH_OPTS_STDIN="-o ConnectTimeout=10 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
 
 # --- Check if any application has proxmox_metrics: true ---
-METRICS_APP=$(yq -r '.applications // {} | to_entries[] | select(.value.proxmox_metrics == true) | .key' "$CONFIG" | head -1)
+METRICS_APP=$(yq -r '.applications // {} | to_entries[] | select(.value.proxmox_metrics == true) | .key' "$APPS_CONFIG" | head -1)
 if [[ -z "$METRICS_APP" ]]; then
   echo "No application has proxmox_metrics: true — skipping metrics configuration"
   exit 0
@@ -38,9 +39,9 @@ echo "Configuring Proxmox metrics → ${METRICS_APP}"
 # Prefer prod IP (Proxmox nodes are on management VLAN, management → prod is
 # allowed per zone policy). Fall back to dev if prod isn't reachable yet
 # (e.g., influxdb-prod not yet deployed).
-INFLUXDB_PORT=$(yq -r ".applications.${METRICS_APP}.health_port" "$CONFIG")
-PROD_IP=$(yq -r ".applications.${METRICS_APP}.environments.prod.ip" "$CONFIG")
-DEV_IP=$(yq -r ".applications.${METRICS_APP}.environments.dev.ip" "$CONFIG")
+INFLUXDB_PORT=$(yq -r ".applications.${METRICS_APP}.health_port" "$APPS_CONFIG")
+PROD_IP=$(yq -r ".applications.${METRICS_APP}.environments.prod.ip" "$APPS_CONFIG")
+DEV_IP=$(yq -r ".applications.${METRICS_APP}.environments.dev.ip" "$APPS_CONFIG")
 
 INFLUXDB_IP=""
 if [[ -n "$PROD_IP" && "$PROD_IP" != "null" ]]; then

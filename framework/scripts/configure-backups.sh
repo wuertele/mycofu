@@ -17,6 +17,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 CONFIG="${REPO_DIR}/site/config.yaml"
+APPS_CONFIG="${REPO_DIR}/site/applications.yaml"
 
 VERIFY_ONLY=0
 while [[ $# -gt 0 ]]; do
@@ -48,7 +49,7 @@ APP_BACKUP_VMS=$(yq -r '
   select(.value.enabled == true and .value.backup == true) |
   .key as $app | .value.environments | keys[] |
   $app + "_" + .
-' "$CONFIG" 2>/dev/null || true)
+' "$APPS_CONFIG" 2>/dev/null || true)
 if [[ -n "$APP_BACKUP_VMS" ]]; then
   BACKUP_VMS="${BACKUP_VMS}
 ${APP_BACKUP_VMS}"

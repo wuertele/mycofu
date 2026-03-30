@@ -12,7 +12,7 @@ terraform {
 }
 
 module "gitlab" {
-  source = "../proxmox-vm"
+  source = "../proxmox-vm-precious"
 
   vm_id         = var.vm_id
   vm_name       = "gitlab"

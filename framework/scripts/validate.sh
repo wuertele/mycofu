@@ -10,6 +10,7 @@
 #   framework/scripts/validate.sh --regression-safe prod  # Non-destructive regression, prod + cluster-wide
 #   framework/scripts/validate.sh --regression dev        # Full regression incl. destructive (dev ONLY)
 #   framework/scripts/validate.sh --regression prod       # REFUSED — destructive tests cannot target prod
+#   framework/scripts/validate.sh --regression-deploy dev # Destroy+redeploy dev VMs, then full regression (dev→prod gate)
 #
 # Regression test scopes:
 #   cluster    — tests cluster-wide properties, run regardless of env arg
@@ -24,17 +25,20 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 CONFIG="${REPO_DIR}/site/config.yaml"
+APPS_CONFIG="${REPO_DIR}/site/applications.yaml"
 
 ENVS=()
 QUICK=0
 REGRESSION=0
 REGRESSION_SAFE=0
+REGRESSION_DEPLOY=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --quick) QUICK=1; shift ;;
     --regression) REGRESSION=1; shift ;;
     --regression-safe) REGRESSION_SAFE=1; shift ;;
+    --regression-deploy) REGRESSION_DEPLOY=1; REGRESSION=1; shift ;;
     prod|dev) ENVS+=("$1"); shift ;;
     --help|-h)
       sed -n '2,/^$/{ s/^# //; s/^#$//; p }' "$0"
@@ -48,16 +52,24 @@ if [[ ${#ENVS[@]} -eq 0 ]]; then
   ENVS=(prod dev)
 fi
 
-# Refuse --regression when prod is in scope (destructive tests must never target prod)
+# Refuse --regression/--regression-deploy when prod is in scope
 if [[ "$REGRESSION" -eq 1 ]]; then
   for _env in "${ENVS[@]}"; do
     if [[ "$_env" == "prod" ]]; then
       echo "ERROR: Destructive regression tests cannot target prod." >&2
-      echo "Destructive tests (R2.5, R5.2, R6.2) only run against dev VMs." >&2
+      echo "Destructive tests only run against dev VMs." >&2
       echo "Use --regression-safe prod for non-destructive regression tests against prod." >&2
       exit 1
     fi
   done
+fi
+
+# --regression-deploy requires exactly "dev" as the environment
+if [[ "$REGRESSION_DEPLOY" -eq 1 ]]; then
+  if [[ ${#ENVS[@]} -ne 1 || "${ENVS[0]}" != "dev" ]]; then
+    echo "ERROR: --regression-deploy requires exactly 'dev' as the environment." >&2
+    exit 2
+  fi
 fi
 
 if [[ ! -f "$CONFIG" ]]; then
@@ -106,6 +118,127 @@ GITLAB_IP=$(yq -r '.vms.gitlab.ip' "$CONFIG")
 PBS_IP=$(yq -r '.vms.pbs.ip' "$CONFIG")
 HEALTH_PORT=$(yq -r '.replication.health_port' "$CONFIG")
 STORAGE_POOL=$(yq -r '.proxmox.storage_pool' "$CONFIG")
+
+# =====================================================================
+# Regression Deploy: destroy dev VMs and redeploy before validation
+# =====================================================================
+if [[ "$REGRESSION_DEPLOY" -eq 1 ]]; then
+  echo ""
+  echo "=== Regression Deploy: Destroy + Redeploy Dev VMs ==="
+  echo ""
+  echo "This test destroys selected dev VMs and redeploys them from the"
+  echo "current code to verify the deploy path works end-to-end."
+  echo ""
+
+  FIRST_NODE_IP=$(yq -r '.nodes[0].mgmt_ip' "$CONFIG")
+  # dns-pair module manages both dns1 and dns2 together — must destroy both
+  DEPLOY_TARGETS="testapp_dev dns1_dev dns2_dev vault_dev"
+
+  # Destroy selected dev VMs
+  for vm in $DEPLOY_TARGETS; do
+    VMID=$(yq -r ".vms.${vm}.vmid" "$CONFIG")
+    VM_IP=$(yq -r ".vms.${vm}.ip" "$CONFIG")
+    echo "  Destroying ${vm} (VMID ${VMID})..."
+    # Find hosting node
+    HOSTING_NODE=$(ssh -n ${SSH_OPTS} "root@${FIRST_NODE_IP}" \
+      "pvesh get /cluster/resources --type vm --output-format json" 2>/dev/null \
+      | python3 -c "
+import sys,json
+for v in json.loads(sys.stdin.read()):
+    if v.get('vmid') == ${VMID}: print(v['node']); break
+" 2>/dev/null || true)
+    if [[ -z "$HOSTING_NODE" ]]; then
+      echo "    WARNING: VM ${vm} not found in cluster — skipping destroy"
+      continue
+    fi
+    HOSTING_IP=$(yq -r ".nodes[] | select(.name == \"${HOSTING_NODE}\") | .mgmt_ip" "$CONFIG")
+    # Remove HA, stop, destroy
+    ssh -n ${SSH_OPTS} "root@${HOSTING_IP}" "ha-manager remove vm:${VMID}" 2>/dev/null || true
+    ssh -n ${SSH_OPTS} "root@${HOSTING_IP}" "qm stop ${VMID} --skiplock" 2>/dev/null || true
+    sleep 3
+    ssh -n ${SSH_OPTS} "root@${HOSTING_IP}" "qm destroy ${VMID} --skiplock --purge" 2>/dev/null || true
+    echo "    Destroyed ${vm}"
+    ssh-keygen -R "$VM_IP" 2>/dev/null || true
+  done
+
+  # Remove destroyed VMs from tofu state so tofu recreates them
+  echo ""
+  echo "  Removing destroyed VMs from tofu state..."
+  cd "${REPO_DIR}"
+  SOPS_AGE_KEY_FILE="${REPO_DIR}/operator.age.key" "${SCRIPT_DIR}/tofu-wrapper.sh" init -input=false >/dev/null 2>&1 || \
+    SOPS_AGE_KEY_FILE="${REPO_DIR}/operator.age.key.production" "${SCRIPT_DIR}/tofu-wrapper.sh" init -input=false >/dev/null 2>&1
+  for vm in $DEPLOY_TARGETS; do
+    # Map config key to tofu module name
+    case "$vm" in
+      dns1_dev|dns2_dev) MODULE="module.dns_dev" ;;
+      vault_dev)         MODULE="module.vault_dev" ;;
+      testapp_dev)       MODULE="module.testapp_dev" ;;
+      *)                 MODULE="module.${vm}" ;;
+    esac
+    "${SCRIPT_DIR}/tofu-wrapper.sh" state rm "${MODULE}" 2>/dev/null || true
+    echo "    Removed ${MODULE} from state"
+  done
+
+  # Redeploy with tofu apply (targeted)
+  echo ""
+  echo "  Redeploying destroyed VMs..."
+  TARGETS=""
+  for vm in $DEPLOY_TARGETS; do
+    case "$vm" in
+      dns1_dev|dns2_dev) TARGETS="$TARGETS -target=module.dns_dev" ;;
+      vault_dev)         TARGETS="$TARGETS -target=module.vault_dev" ;;
+      testapp_dev)       TARGETS="$TARGETS -target=module.testapp_dev" ;;
+      *)                 TARGETS="$TARGETS -target=module.${vm}" ;;
+    esac
+  done
+  # Deduplicate targets
+  TARGETS=$(echo "$TARGETS" | tr ' ' '\n' | sort -u | tr '\n' ' ')
+  "${SCRIPT_DIR}/tofu-wrapper.sh" apply $TARGETS -auto-approve -input=false
+  echo "  Tofu apply complete"
+
+  # Wait for VMs to boot and initialize
+  echo ""
+  echo "  Waiting for VMs to initialize..."
+  for vm in $DEPLOY_TARGETS; do
+    VM_IP=$(yq -r ".vms.${vm}.ip" "$CONFIG")
+    echo -n "    ${vm} (${VM_IP}): "
+    for attempt in $(seq 1 30); do
+      if ssh -n -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 \
+           -o BatchMode=yes "root@${VM_IP}" "true" 2>/dev/null; then
+        echo "up (${attempt}0s)"
+        break
+      fi
+      sleep 10
+    done
+  done
+
+  # Wait for certificates (vault and dns need certs before being fully functional)
+  echo "  Waiting for certificates..."
+  sleep 30
+
+  # Initialize and configure Vault if it was recreated.
+  # Detect the SOPS age key — operator may use either filename.
+  if echo "$DEPLOY_TARGETS" | grep -q "vault_dev"; then
+    echo "  Initializing vault-dev..."
+    if [[ -z "${SOPS_AGE_KEY_FILE:-}" ]]; then
+      if [[ -f "${REPO_DIR}/operator.age.key" ]]; then
+        export SOPS_AGE_KEY_FILE="${REPO_DIR}/operator.age.key"
+      elif [[ -f "${REPO_DIR}/operator.age.key.production" ]]; then
+        export SOPS_AGE_KEY_FILE="${REPO_DIR}/operator.age.key.production"
+      fi
+    fi
+    "${SCRIPT_DIR}/init-vault.sh" dev 2>&1 | tail -1
+    "${SCRIPT_DIR}/configure-vault.sh" dev 2>&1 | tail -1
+  fi
+
+  # Configure replication for recreated VMs
+  echo "  Configuring replication..."
+  "${SCRIPT_DIR}/configure-replication.sh" "*" >/dev/null 2>&1 || true
+
+  echo ""
+  echo "  Deploy phase complete. Proceeding with validation..."
+  echo ""
+fi
 
 # =====================================================================
 echo "=== Network ==="
@@ -216,7 +349,7 @@ check "PBS API responds" \
 
 # Check that backup jobs exist for all VMs with backup: true (infrastructure + applications)
 BACKUP_VMS=$(yq -r '.vms | to_entries[] | select(.value.backup == true) | .key' "$CONFIG")
-BACKUP_APPS=$(yq -r '.applications // {} | to_entries[] | select(.value.enabled == true and .value.backup == true) | .key' "$CONFIG" 2>/dev/null || true)
+BACKUP_APPS=$(yq -r '.applications // {} | to_entries[] | select(.value.enabled == true and .value.backup == true) | .key' "$APPS_CONFIG" 2>/dev/null || true)
 if [[ -n "$BACKUP_VMS" || -n "$BACKUP_APPS" ]]; then
   check "Backup jobs configured for VMs with precious state" \
     "${SCRIPT_DIR}/configure-backups.sh" --verify
@@ -300,11 +433,11 @@ for ENV in "${ENVS[@]}"; do
       bash -c "curl -sf http://${TESTAPP_IP}:8080/ | jq -e '.status == \"healthy\" and .count > 0'"
   fi
 
-  # Catalog applications (from config.yaml applications block)
+  # Catalog applications (from applications.yaml)
   # Health port/path come from the catalog module's metadata.yaml, not config.yaml.
-  APP_NAMES=$(yq -r '.applications // {} | to_entries[] | select(.value.enabled == true and .value.monitor == true) | .key' "$CONFIG" 2>/dev/null || true)
+  APP_NAMES=$(yq -r '.applications // {} | to_entries[] | select(.value.enabled == true and .value.monitor == true) | .key' "$APPS_CONFIG" 2>/dev/null || true)
   for APP in $APP_NAMES; do
-    APP_IP=$(yq -r ".applications.${APP}.environments.${ENV}.ip // \"\"" "$CONFIG")
+    APP_IP=$(yq -r ".applications.${APP}.environments.${ENV}.ip // \"\"" "$APPS_CONFIG")
     HEALTH_FILE="${REPO_DIR}/framework/catalog/${APP}/health.yaml"
     if [[ ! -f "$HEALTH_FILE" ]]; then
       continue
@@ -325,13 +458,13 @@ echo "=== Dual-NIC (mgmt_nic) Connectivity ==="
 # For VMs with mgmt_nic in config.yaml, verify all connectivity paths.
 
 for ENV in "${ENVS[@]}"; do
-  APP_NAMES=$(yq -r '.applications // {} | to_entries[] | select(.value.enabled == true) | .key' "$CONFIG" 2>/dev/null || true)
+  APP_NAMES=$(yq -r '.applications // {} | to_entries[] | select(.value.enabled == true) | .key' "$APPS_CONFIG" 2>/dev/null || true)
   for APP in $APP_NAMES; do
-    MGMT_IP=$(yq -r ".applications.${APP}.environments.${ENV}.mgmt_nic.ip // \"\"" "$CONFIG")
+    MGMT_IP=$(yq -r ".applications.${APP}.environments.${ENV}.mgmt_nic.ip // \"\"" "$APPS_CONFIG")
     [[ -z "$MGMT_IP" || "$MGMT_IP" == "null" ]] && continue
 
-    VLAN_IP=$(yq -r ".applications.${APP}.environments.${ENV}.ip" "$CONFIG")
-    VM_NODE=$(yq -r ".applications.${APP}.environments.${ENV}.node" "$CONFIG")
+    VLAN_IP=$(yq -r ".applications.${APP}.environments.${ENV}.ip" "$APPS_CONFIG")
+    VM_NODE=$(yq -r ".applications.${APP}.environments.${ENV}.node" "$APPS_CONFIG")
     VM_LABEL="${APP}-${ENV}"
 
     # Find a same-VLAN peer on a different node
@@ -551,10 +684,10 @@ if [[ "$REGRESSION" -eq 1 || "$REGRESSION_SAFE" -eq 1 ]]; then
         fi
       done
       # Catalog applications
-      for app in \$(yq -r '.applications // {} | to_entries[] | select(.value.enabled == true) | .key' '$CONFIG' 2>/dev/null); do
-        for env in \$(yq -r \".applications.\${app}.environments | keys | .[]\" '$CONFIG' 2>/dev/null); do
+      for app in \$(yq -r '.applications // {} | to_entries[] | select(.value.enabled == true) | .key' '$APPS_CONFIG' 2>/dev/null); do
+        for env in \$(yq -r \".applications.\${app}.environments | keys | .[]\" '$APPS_CONFIG' 2>/dev/null); do
           # Node can be per-environment or shared at the app level
-          INTENDED=\$(yq -r \".applications.\${app}.environments.\${env}.node // .applications.\${app}.node\" '$CONFIG')
+          INTENDED=\$(yq -r \".applications.\${app}.environments.\${env}.node // .applications.\${app}.node\" '$APPS_CONFIG')
           VM_NAME=\"\${app}-\${env}\"
           ACTUAL=\$(echo \"\$RESOURCES\" | jq -r \".[] | select(.name==\\\"\${VM_NAME}\\\") | .node\" 2>/dev/null)
           if [[ -n \"\$ACTUAL\" && \"\$INTENDED\" != \"null\" && \"\$INTENDED\" != \"\$ACTUAL\" ]]; then
@@ -713,7 +846,7 @@ if [[ "$REGRESSION" -eq 1 || "$REGRESSION_SAFE" -eq 1 ]]; then
 
   # R6.1 — Backup jobs exist for precious-state VMs [cluster]
   BACKUP_VMS_REG=$(yq -r '.vms | to_entries[] | select(.value.backup == true) | .key' "$CONFIG")
-  BACKUP_APPS_REG=$(yq -r '.applications // {} | to_entries[] | select(.value.enabled == true and .value.backup == true) | .key' "$CONFIG" 2>/dev/null || true)
+  BACKUP_APPS_REG=$(yq -r '.applications // {} | to_entries[] | select(.value.enabled == true and .value.backup == true) | .key' "$APPS_CONFIG" 2>/dev/null || true)
   if [[ -n "$BACKUP_VMS_REG" || -n "$BACKUP_APPS_REG" ]]; then
     check "R6.1: Backup jobs exist for precious-state VMs" \
       "${SCRIPT_DIR}/configure-backups.sh" --verify
@@ -783,7 +916,7 @@ if [[ "$REGRESSION" -eq 1 || "$REGRESSION_SAFE" -eq 1 ]]; then
 
     local plan_output exitcode
     exitcode=0
-    plan_output=$("$wrapper" plan -detailed-exitcode -no-color "${targets[@]}" 2>&1) || exitcode=$?
+    plan_output=$("$wrapper" plan -detailed-exitcode -no-color ${targets[@]+"${targets[@]}"} 2>&1) || exitcode=$?
 
     if [[ "$exitcode" -eq 0 ]]; then
       # No changes — ideal state

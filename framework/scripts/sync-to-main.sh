@@ -32,10 +32,17 @@ echo "Checking out main..."
 git checkout main
 
 echo "Applying framework changes from dev..."
-git diff main..dev -- framework/ docs/ README.md architecture.md GETTING-STARTED.md OPERATIONS.md .gitlab-ci.yml flake.nix flake.lock CLAUDE.md | git apply --allow-empty
+DIFF=$(git diff main..dev -- framework/ docs/ README.md architecture.md GETTING-STARTED.md OPERATIONS.md .gitlab-ci.yml flake.nix flake.lock CLAUDE.md)
+if [[ -n "$DIFF" ]]; then
+  echo "$DIFF" | git apply
+else
+  echo "No framework changes to apply."
+  git checkout dev
+  exit 0
+fi
 
 echo "Staging and committing..."
-git add -A
+git add framework/ docs/ README.md architecture.md GETTING-STARTED.md OPERATIONS.md .gitlab-ci.yml flake.nix flake.lock CLAUDE.md 2>/dev/null || true
 if git diff --cached --quiet; then
   echo "No changes to commit."
   git checkout dev

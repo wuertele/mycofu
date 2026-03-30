@@ -47,7 +47,15 @@ validate:plan:
     - echo "=== OpenTofu Validate ==="
     - framework/scripts/tofu-wrapper.sh validate
     - echo "=== OpenTofu Plan ==="
-    - framework/scripts/tofu-wrapper.sh plan -no-color
+    - |
+      IMAGE_VERSIONS="site/tofu/image-versions.auto.tfvars"
+      if [[ ! -f "$IMAGE_VERSIONS" ]] || grep -q "Placeholder" "$IMAGE_VERSIONS" 2>/dev/null; then
+        echo "image-versions.auto.tfvars not available (validate stage runs before build)."
+        echo "Plan would show phantom drift for every VM. Skipping."
+        echo "Accurate plan runs in the deploy stage with real image versions."
+      else
+        framework/scripts/tofu-wrapper.sh plan -no-color
+      fi
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_COMMIT_BRANCH == "dev"
@@ -88,6 +96,18 @@ validate:nix-checks:
     - if: $CI_COMMIT_BRANCH == "dev"
     - if: $CI_COMMIT_BRANCH == "prod"
 
+# Guard: block prod MRs if control-plane images have drifted.
+# The pipeline cannot deploy Tier 2 VMs (it runs on them). If the MR
+# changes their images, the operator must deploy from the workstation
+# first, then retry this job. Uses nix eval (no build needed).
+guard:control-plane:
+  stage: validate
+  tags: [infra]
+  script:
+    - framework/scripts/check-control-plane-drift.sh
+  rules:
+    - if: $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "prod"
+
 # --- Build ---
 
 build:images:
@@ -117,9 +137,27 @@ deploy:dev:
   dependencies:
     - build:images
   script:
+    - echo "=== Pre-deploy backup ==="
+    - |
+      FIRST_NODE=$(yq -r '.nodes[0].mgmt_ip' site/config.yaml)
+      PBS_REGISTERED=$(ssh -n -o ConnectTimeout=5 -o StrictHostKeyChecking=no -o BatchMode=yes \
+        "root@${FIRST_NODE}" "pvesm status 2>/dev/null | grep -c pbs-nas" 2>/dev/null || echo "0")
+      if framework/scripts/backup-now.sh; then
+        echo "Pre-deploy backup complete"
+      elif [[ "$PBS_REGISTERED" -gt 0 ]]; then
+        echo "FATAL: PBS is configured but backup failed. Refusing to deploy." >&2
+        echo "Fix the backup failure before deploying." >&2
+        exit 1
+      else
+        echo "WARNING: PBS not yet configured — skipping pre-deploy backup"
+        echo "This is expected on first deploy."
+      fi
     - echo "=== Deploying to dev ==="
     - framework/scripts/tofu-wrapper.sh init -input=false
+    - framework/scripts/ensure-app-secrets.sh
     - framework/scripts/safe-apply.sh dev
+    - echo "=== Restoring recreated precious-state VMs ==="
+    - framework/scripts/restore-after-deploy.sh dev
     - echo "=== Cleaning stale replication ==="
     - framework/scripts/configure-replication.sh "*"
     - echo "=== Post-deploy recovery ==="
@@ -155,9 +193,27 @@ deploy:prod:
   dependencies:
     - build:images
   script:
+    - echo "=== Pre-deploy backup ==="
+    - |
+      FIRST_NODE=$(yq -r '.nodes[0].mgmt_ip' site/config.yaml)
+      PBS_REGISTERED=$(ssh -n -o ConnectTimeout=5 -o StrictHostKeyChecking=no -o BatchMode=yes \
+        "root@${FIRST_NODE}" "pvesm status 2>/dev/null | grep -c pbs-nas" 2>/dev/null || echo "0")
+      if framework/scripts/backup-now.sh; then
+        echo "Pre-deploy backup complete"
+      elif [[ "$PBS_REGISTERED" -gt 0 ]]; then
+        echo "FATAL: PBS is configured but backup failed. Refusing to deploy." >&2
+        echo "Fix the backup failure before deploying." >&2
+        exit 1
+      else
+        echo "WARNING: PBS not yet configured — skipping pre-deploy backup"
+        echo "This is expected on first deploy."
+      fi
     - echo "=== Deploying to prod ==="
     - framework/scripts/tofu-wrapper.sh init -input=false
+    - framework/scripts/ensure-app-secrets.sh
     - framework/scripts/safe-apply.sh prod
+    - echo "=== Restoring recreated precious-state VMs ==="
+    - framework/scripts/restore-after-deploy.sh prod
     - echo "=== Cleaning stale replication ==="
     - framework/scripts/configure-replication.sh "*"
     - echo "=== Post-deploy recovery ==="

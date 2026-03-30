@@ -107,8 +107,8 @@ echo "=== Policies ==="
 for policy in dns vault-self default; do
   POLICY_FILE="${REPO_DIR}/framework/vault/policies/${policy}.hcl"
   if [[ ! -f "$POLICY_FILE" ]]; then
-    echo "WARNING: Policy file not found: ${POLICY_FILE}" >&2
-    continue
+    echo "ERROR: Policy file not found: ${POLICY_FILE}" >&2
+    exit 1
   fi
   POLICY_CONTENT=$(cat "$POLICY_FILE")
   echo "Writing ${policy}-policy..."

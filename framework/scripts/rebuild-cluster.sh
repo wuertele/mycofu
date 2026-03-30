@@ -31,6 +31,7 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 CONFIG="${REPO_DIR}/site/config.yaml"
+APPS_CONFIG="${REPO_DIR}/site/applications.yaml"
 TOFU_DIR="${REPO_DIR}/framework/tofu/root"
 LOG_DIR="${REPO_DIR}/build"
 LOG_FILE="${LOG_DIR}/rebuild.log"
@@ -521,6 +522,22 @@ if [[ -n "$PBS_VMID_CHECK" && "$PBS_VMID_CHECK" != "null" ]]; then
   fi
 fi
 
+# Pre-apply backup: back up all precious-state VMs before tofu apply destroys
+# and recreates them. This ensures the backup is fresh regardless of the PBS
+# schedule. If PBS is unreachable (e.g., PBS itself is being rebuilt), warn
+# but proceed — the operator accepted this risk by running rebuild-cluster.sh.
+if [[ -x "${SCRIPT_DIR}/backup-now.sh" ]]; then
+  log "    Taking pre-deploy backup of precious-state VMs..."
+  if "${SCRIPT_DIR}/backup-now.sh" 2>&1 | sed 's/^/    /'; then
+    log "    Pre-deploy backup complete"
+  else
+    log "    WARNING: Pre-deploy backup failed — proceeding with existing backups"
+    log "    If this is a full rebuild (PBS not yet deployed), this is expected."
+  fi
+else
+  log "    WARNING: backup-now.sh not found — skipping pre-deploy backup"
+fi
+
 # HA double-apply: when VMs are recreated with new VMIDs, Proxmox removes the
 # HA resource. The first apply may fail on HA resource updates. A second apply
 # creates the fresh HA resources. This is a known provider limitation.
@@ -529,10 +546,31 @@ if [[ -n "$TOFU_TARGETS" ]]; then
   log "    Scoped apply targets: $TOFU_TARGETS"
   APPLY_ARGS="$TOFU_TARGETS $APPLY_ARGS"
 fi
-if ! "${SCRIPT_DIR}/tofu-wrapper.sh" apply $APPLY_ARGS; then
-  log "    First apply had errors (likely HA resources) — running second apply..."
-  "${SCRIPT_DIR}/tofu-wrapper.sh" apply $APPLY_ARGS
+
+# Control-plane VMs (gitlab, cicd) use proxmox-vm-precious with prevent_destroy.
+# rebuild-cluster.sh is the authorized path for recreating them — override
+# prevent_destroy with -replace= for each control-plane VM in the target list.
+PRECIOUS_REPLACE=""
+for mod in $CONTROL_PLANE_MODULES; do
+  if [[ "$TOFU_TARGETS" == *"$mod"* || -z "$TOFU_TARGETS" ]]; then
+    # Determine the inner resource address for -replace=
+    mod_name=$(echo "$mod" | sed 's/module\.//')
+    RESOURCE="${mod}.module.${mod_name}.proxmox_virtual_environment_vm.vm"
+    # Only add -replace if the resource exists in state
+    if "${SCRIPT_DIR}/tofu-wrapper.sh" state list 2>/dev/null | grep -q "${RESOURCE}"; then
+      PRECIOUS_REPLACE="$PRECIOUS_REPLACE -replace=${RESOURCE}"
+      log "    Will replace control-plane VM: ${RESOURCE}"
+    fi
+  fi
+done
+if [[ -n "$PRECIOUS_REPLACE" ]]; then
+  APPLY_ARGS="$PRECIOUS_REPLACE $APPLY_ARGS"
 fi
+
+"${SCRIPT_DIR}/tofu-wrapper.sh" apply $APPLY_ARGS
+echo ""
+echo "=== Second apply (HA resources) ==="
+"${SCRIPT_DIR}/tofu-wrapper.sh" apply $APPLY_ARGS
 cd "$REPO_DIR"
 # Refresh SSH host keys for all VMs (they may have been recreated)
 log "    Refreshing SSH host keys for all VMs..."
@@ -661,33 +699,43 @@ step_start 7.6 "Restore precious state from PBS"
 if [[ -n "$SCOPE" ]]; then
   # Scoped restore: only restore VMs that are in the target list
   RESTORED_ANY=false
+  RESTORE_FAILURES=0
   # Collect VMIDs for scoped VMs that have backup: true
   for vm_key in $(yq -r '.vms | to_entries[] | select(.value.backup == true) | .key' "$CONFIG"); do
     VMID=$(yq -r ".vms.${vm_key}.vmid" "$CONFIG")
     if [[ "$TOFU_TARGETS" == *"module.${vm_key}"* || "$TOFU_TARGETS" == *"module.$(echo "$vm_key" | sed 's/_[^_]*$//')"* ]]; then
       log "    Restoring vdb for ${vm_key} (VMID ${VMID})..."
-      "${SCRIPT_DIR}/restore-from-pbs.sh" --target "$VMID" || log "    WARNING: restore failed for ${vm_key}"
+      if ! "${SCRIPT_DIR}/restore-from-pbs.sh" --target "$VMID" --force; then
+        log "    ERROR: restore failed for ${vm_key}"
+        RESTORE_FAILURES=$((RESTORE_FAILURES + 1))
+      fi
       RESTORED_ANY=true
     fi
   done
   # Application VMs
-  for app_key in $(yq -r '.applications | to_entries[] | select(.value.enabled == true and .value.backup == true) | .key' "$CONFIG" 2>/dev/null); do
+  for app_key in $(yq -r '.applications // {} | to_entries[] | select(.value.enabled == true and .value.backup == true) | .key' "$APPS_CONFIG" 2>/dev/null); do
     for env in prod dev; do
-      VMID=$(yq -r ".applications.${app_key}.environments.${env}.vmid // \"\"" "$CONFIG")
+      VMID=$(yq -r ".applications.${app_key}.environments.${env}.vmid // \"\"" "$APPS_CONFIG")
       [[ -z "$VMID" ]] && continue
       MOD_NAME="${app_key}_${env}"
       if [[ "$TOFU_TARGETS" == *"module.${MOD_NAME}"* ]]; then
         log "    Restoring vdb for ${MOD_NAME} (VMID ${VMID})..."
-        "${SCRIPT_DIR}/restore-from-pbs.sh" --target "$VMID" || log "    WARNING: restore failed for ${MOD_NAME}"
+        if ! "${SCRIPT_DIR}/restore-from-pbs.sh" --target "$VMID" --force; then
+          log "    ERROR: restore failed for ${MOD_NAME}"
+          RESTORE_FAILURES=$((RESTORE_FAILURES + 1))
+        fi
         RESTORED_ANY=true
       fi
     done
   done
+  if [[ $RESTORE_FAILURES -gt 0 ]]; then
+    die "PBS restore failed for ${RESTORE_FAILURES} VM(s). Check output above."
+  fi
   if [[ "$RESTORED_ANY" == "false" ]]; then
     log "    No scoped VMs need PBS restore"
   fi
 else
-  "${SCRIPT_DIR}/restore-from-pbs.sh"
+  "${SCRIPT_DIR}/restore-from-pbs.sh" --force
 fi
 step_done 7.6 "PBS restore complete"
 
@@ -751,8 +799,8 @@ for ENV in prod dev; do
     fi
   done
   # Application VMs
-  for APP_KEY in $(yq -r '.applications | to_entries[] | select(.value.enabled == true) | .key' "$CONFIG" 2>/dev/null); do
-    VM_IP=$(yq -r ".applications.${APP_KEY}.environments.${ENV}.ip // \"\"" "$CONFIG")
+  for APP_KEY in $(yq -r '.applications // {} | to_entries[] | select(.value.enabled == true) | .key' "$APPS_CONFIG" 2>/dev/null); do
+    VM_IP=$(yq -r ".applications.${APP_KEY}.environments.${ENV}.ip // \"\"" "$APPS_CONFIG")
     [[ -z "$VM_IP" || "$VM_IP" == "null" ]] && continue
     EMPTY_CERT=$(cert_ssh "$VM_IP" '
       for d in /etc/letsencrypt/live/*/; do
@@ -807,8 +855,8 @@ for ENV in prod dev; do
     check_cert_domain "$VM_IP" "$EXPECTED_FQDN" "$VM_KEY"
   done
   # Application VMs
-  for APP_KEY in $(yq -r '.applications | to_entries[] | select(.value.enabled == true) | .key' "$CONFIG" 2>/dev/null); do
-    VM_IP=$(yq -r ".applications.${APP_KEY}.environments.${ENV}.ip // \"\"" "$CONFIG")
+  for APP_KEY in $(yq -r '.applications // {} | to_entries[] | select(.value.enabled == true) | .key' "$APPS_CONFIG" 2>/dev/null); do
+    VM_IP=$(yq -r ".applications.${APP_KEY}.environments.${ENV}.ip // \"\"" "$APPS_CONFIG")
     [[ -z "$VM_IP" || "$VM_IP" == "null" ]] && continue
     EXPECTED_FQDN="${APP_KEY}.${ENV}.${DOMAIN}"
     check_cert_domain "$VM_IP" "$EXPECTED_FQDN" "${APP_KEY}_${ENV}"
@@ -1243,9 +1291,9 @@ fi
 # Get precious-state VMIDs (same source as configure-backups.sh / restore-from-pbs.sh)
 PRECIOUS_INFRA=$(yq -r '.vms | to_entries[] | select(.value.backup == true) | .value.vmid' "$CONFIG" 2>/dev/null)
 PRECIOUS_APPS=""
-for BACKUP_APP in $(yq -r '.applications | to_entries[] | select(.value.enabled == true and .value.backup == true) | .key' "$CONFIG" 2>/dev/null); do
-  for BACKUP_ENV in $(yq -r ".applications.${BACKUP_APP}.environments | keys | .[]" "$CONFIG" 2>/dev/null); do
-    PRECIOUS_APPS+=" $(yq -r ".applications.${BACKUP_APP}.environments.${BACKUP_ENV}.vmid" "$CONFIG")"
+for BACKUP_APP in $(yq -r '.applications // {} | to_entries[] | select(.value.enabled == true and .value.backup == true) | .key' "$APPS_CONFIG" 2>/dev/null); do
+  for BACKUP_ENV in $(yq -r ".applications.${BACKUP_APP}.environments | keys | .[]" "$APPS_CONFIG" 2>/dev/null); do
+    PRECIOUS_APPS+=" $(yq -r ".applications.${BACKUP_APP}.environments.${BACKUP_ENV}.vmid" "$APPS_CONFIG")"
   done
 done
 ALL_PRECIOUS="${PRECIOUS_INFRA} ${PRECIOUS_APPS}"

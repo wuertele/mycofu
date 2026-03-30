@@ -343,9 +343,9 @@
     };
   };
 
-  # ── DEBUG: temporary empty root password for Proxmox console access ──
-  # TODO: Remove before production use
-  users.users.root.initialHashedPassword = "";
+  # Disable password login for root. SSH key auth is the only access path
+  # (pubkey delivered via CIDATA). "!" locks the password field in /etc/shadow.
+  users.users.root.initialHashedPassword = "!";
 
   # ── SSH ─────────────────────────────────────────────────────────────
   services.openssh = {

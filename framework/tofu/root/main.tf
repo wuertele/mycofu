@@ -11,7 +11,9 @@ locals {
   prod_domain = "prod.${local.domain}"
   dev_domain  = "dev.${local.domain}"
   gitlab_url  = "https://gitlab.prod.${local.domain}"
-  _raw_apps    = try(local.config.applications, null)
+  # Application VMs are in site/applications.yaml (separate from config.yaml)
+  _apps_file   = try(yamldecode(file("${path.module}/../../../site/applications.yaml")), {})
+  _raw_apps    = try(local._apps_file.applications, null)
   applications = local._raw_apps != null ? local._raw_apps : tomap({})
 
   # ACME URL for prod VMs — derived from config.yaml acme mode

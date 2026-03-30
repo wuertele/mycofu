@@ -12,6 +12,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 CONFIG="${REPO_DIR}/site/config.yaml"
+APPS_CONFIG="${REPO_DIR}/site/applications.yaml"
 
 if [[ ! -f "$CONFIG" ]]; then
   echo "ERROR: config.yaml not found: $CONFIG" >&2
@@ -52,7 +53,8 @@ backup_vm() {
   done
 
   if [[ -z "$host_ip" ]]; then
-    echo "  SKIP: ${label} (VMID ${vmid}) — not found on any node"
+    echo "  FAILED: ${label} (VMID ${vmid}) — not found on any node"
+    FAILED=$((FAILED + 1))
     return
   fi
 
@@ -78,9 +80,9 @@ for vm_key in $(yq -r '.vms | to_entries[] | select(.value.backup == true) | .ke
 done
 
 # Application VMs with backup: true
-for app_key in $(yq -r '.applications | to_entries[] | select(.value.enabled == true and .value.backup == true) | .key' "$CONFIG" 2>/dev/null); do
+for app_key in $(yq -r '.applications // {} | to_entries[] | select(.value.enabled == true and .value.backup == true) | .key' "$APPS_CONFIG" 2>/dev/null); do
   for env in prod dev; do
-    vmid=$(yq -r ".applications.${app_key}.environments.${env}.vmid // \"\"" "$CONFIG")
+    vmid=$(yq -r ".applications.${app_key}.environments.${env}.vmid // \"\"" "$APPS_CONFIG")
     [[ -z "$vmid" || "$vmid" == "null" ]] && continue
     backup_vm "${app_key}_${env}" "$vmid"
   done

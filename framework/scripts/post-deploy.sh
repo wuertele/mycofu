@@ -58,46 +58,27 @@ elif [[ "$INITIALIZED" == "true" && "$SEALED" == "true" ]]; then
       -d "{\"key\": \"${UNSEAL_KEY}\"}" >/dev/null
     echo "Vault ${ENV} unsealed."
   else
-    echo "WARNING: Vault ${ENV} is sealed and no unseal key on vdb." >&2
+    echo "ERROR: Vault ${ENV} is sealed and no unseal key on vdb." >&2
     echo "Operator must run: init-vault.sh ${ENV}" >&2
-  fi
-elif [[ "$INITIALIZED" == "false" ]]; then
-  echo "Vault ${ENV} is uninitialized — initializing..."
-
-  # Wait for TLS cert (certbot runs at boot)
-  for i in $(seq 1 30); do
-    if curl -sk "https://${VAULT_IP}:8200/" -o /dev/null 2>&1; then
-      break
-    fi
-    echo "Waiting for vault-${ENV} TLS cert... ($i/30)"
-    sleep 10
-  done
-
-  # Initialize
-  INIT_OUTPUT=$(curl -sk -X PUT "https://${VAULT_IP}:8200/v1/sys/init" \
-    -d '{"secret_shares": 1, "secret_threshold": 1}')
-  UNSEAL_KEY=$(echo "$INIT_OUTPUT" | jq -r '.keys_base64[0]')
-  ROOT_TOKEN=$(echo "$INIT_OUTPUT" | jq -r '.root_token')
-
-  if [[ -z "$UNSEAL_KEY" || "$UNSEAL_KEY" == "null" ]]; then
-    echo "ERROR: Vault ${ENV} initialization failed" >&2
-    echo "$INIT_OUTPUT" >&2
     exit 1
   fi
-
-  # Unseal
-  curl -sk -X PUT "https://${VAULT_IP}:8200/v1/sys/unseal" \
-    -d "{\"key\": \"${UNSEAL_KEY}\"}" >/dev/null
-  echo "Vault ${ENV} initialized and unsealed."
-
-  # Write keys to vdb (persistent across reboots)
-  ssh $SSH_OPTS "root@${VAULT_IP}" \
-    "mkdir -p /var/lib/vault && printf '%s' '${UNSEAL_KEY}' > /var/lib/vault/unseal-key && chmod 400 /var/lib/vault/unseal-key"
-  ssh $SSH_OPTS "root@${VAULT_IP}" \
-    "printf '%s' '${ROOT_TOKEN}' > /var/lib/vault/root-token && chmod 400 /var/lib/vault/root-token"
-  echo "Unseal key and root token written to vdb."
-
-  echo "WARNING: SOPS not updated — operator must run init-vault.sh ${ENV} to backup keys to SOPS." >&2
+elif [[ "$INITIALIZED" == "false" ]]; then
+  # Do NOT initialize Vault from the pipeline. Vault initialization
+  # generates an unseal key and root token that MUST be stored in SOPS
+  # atomically. The pipeline cannot commit to git, so initializing here
+  # creates a SOPS drift time bomb: vdb has new tokens, SOPS has stale
+  # ones. On the next PBS restore + init-vault.sh run, the mismatch
+  # triggers auto-recovery which wipes all Vault data.
+  echo ""
+  echo "=================================================="
+  echo "ACTION REQUIRED: Vault ${ENV} needs initialization"
+  echo "=================================================="
+  echo ""
+  echo "Run from the workstation (where SOPS can be updated):"
+  echo "  framework/scripts/init-vault.sh ${ENV}"
+  echo "  framework/scripts/configure-vault.sh ${ENV}"
+  echo ""
+  exit 1
 fi
 
 # Always configure vault (idempotent) — read root token from vdb if needed
@@ -107,14 +88,23 @@ fi
 if [[ -n "$ROOT_TOKEN" ]]; then
   VAULT_ROOT_TOKEN="$ROOT_TOKEN" "${SCRIPT_DIR}/configure-vault.sh" "${ENV}"
 else
-  echo "Skipping vault configuration — no root token available."
+  echo "ERROR: No root token available for vault configuration." >&2
   echo "Operator must run: configure-vault.sh ${ENV}" >&2
+  exit 1
 fi
 
 # --- PBS backup jobs ---
 echo ""
 echo "=== PBS backup jobs ==="
-"${SCRIPT_DIR}/configure-backups.sh" || true
+# Only configure backup jobs if PBS storage is registered in Proxmox.
+# On first deploy, PBS hasn't been installed yet (install-pbs.sh runs later),
+# so pbs-nas storage won't exist. Failing here would be a false error.
+FIRST_NODE_IP=$(yq -r '.nodes[0].mgmt_ip' "$CONFIG")
+if ssh $SSH_OPTS "root@${FIRST_NODE_IP}" "pvesm status 2>/dev/null | grep -q pbs-nas" 2>/dev/null; then
+  "${SCRIPT_DIR}/configure-backups.sh"
+else
+  echo "  PBS storage not available — skipping backup jobs"
+fi
 
 echo ""
 echo "=== Post-deploy complete ==="

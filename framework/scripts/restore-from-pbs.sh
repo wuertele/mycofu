@@ -5,6 +5,7 @@
 #   framework/scripts/restore-from-pbs.sh              # Restore all precious VMs
 #   framework/scripts/restore-from-pbs.sh --dry-run    # Show what would be restored
 #   framework/scripts/restore-from-pbs.sh --target 500 # Restore a single VMID
+#   framework/scripts/restore-from-pbs.sh --force      # Overwrite vdb even if it has data
 #
 # For each precious-state VM (backup: true in config.yaml), checks if a PBS
 # backup exists with the same VMID. If so, restores ONLY the data disk (vdb)
@@ -20,14 +21,17 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 CONFIG="${REPO_DIR}/site/config.yaml"
+APPS_CONFIG="${REPO_DIR}/site/applications.yaml"
 
 DRY_RUN=0
 TARGET_VMID=""
+FORCE=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --dry-run) DRY_RUN=1; shift ;;
     --target) TARGET_VMID="$2"; shift 2 ;;
+    --force) FORCE=1; shift ;;
     *) echo "Unknown argument: $1" >&2; exit 1 ;;
   esac
 done
@@ -75,12 +79,12 @@ done < <(yq -r '.vms | to_entries[] | select(.value.backup == true) | .key' "$CO
 # Application VMs with backup: true
 while IFS= read -r app_key; do
   [[ -z "$app_key" ]] && continue
-  for env in $(yq -r ".applications.${app_key}.environments | keys | .[]" "$CONFIG" 2>/dev/null); do
-    vmid=$(yq -r ".applications.${app_key}.environments.${env}.vmid" "$CONFIG")
+  for env in $(yq -r ".applications.${app_key}.environments | keys | .[]" "$APPS_CONFIG" 2>/dev/null); do
+    vmid=$(yq -r ".applications.${app_key}.environments.${env}.vmid" "$APPS_CONFIG")
     PRECIOUS_VMIDS+=("$vmid")
     PRECIOUS_NAMES+=("${app_key}_${env}")
   done
-done < <(yq -r '.applications | to_entries[] | select(.value.enabled == true and .value.backup == true) | .key' "$CONFIG")
+done < <(yq -r '.applications // {} | to_entries[] | select(.value.enabled == true and .value.backup == true) | .key' "$APPS_CONFIG" 2>/dev/null)
 
 if [[ ${#PRECIOUS_VMIDS[@]} -eq 0 ]]; then
   echo "No VMs with backup: true in config.yaml — nothing to restore"
@@ -121,6 +125,7 @@ BACKUP_JSON=$(ssh_node "$FIRST_NODE_IP" \
   "pvesh get /nodes/\$(hostname)/storage/pbs-nas/content --output-format json 2>/dev/null" || echo "[]")
 
 RESTORE_COUNT=0
+FAIL_COUNT=0
 
 # --- Restore each VM ---
 # Order: vault first, then gitlab, then applications
@@ -179,12 +184,33 @@ for v in json.loads(sys.stdin.read()):
 " 2>/dev/null)
 
   if [[ -z "$HOSTING_NODE" ]]; then
-    echo "  WARNING: VM ${VMID} not found in cluster — skipping"
+    echo "  FAILED: VM ${VMID} not found in cluster — skipping"
+    FAIL_COUNT=$((FAIL_COUNT + 1))
     continue
   fi
 
   HOSTING_IP=$(yq -r ".nodes[] | select(.name == \"${HOSTING_NODE}\") | .mgmt_ip" "$CONFIG")
   echo "  Hosted on: ${HOSTING_NODE} (${HOSTING_IP})"
+
+  # Check if vdb already has data. If the VM's data disk has a formatted
+  # filesystem, it was already initialized (by a previous boot or a prior
+  # restore). Restoring would stop a running VM unnecessarily.
+  # The format-vdb service creates ext4 on first boot — if ext4 exists,
+  # the VM has been initialized.
+  # Find the scsi1 zvol name from the VM config (disk numbering varies).
+  VDB_ZVOL=$(ssh_node "$HOSTING_IP" \
+    "qm config ${VMID} 2>/dev/null | grep '^scsi1:' | sed 's/.*${STORAGE_POOL}://' | sed 's/,.*//'")
+  if [[ -n "$VDB_ZVOL" ]]; then
+    VDB_HAS_DATA=$(ssh_node "$HOSTING_IP" \
+      "blkid /dev/zvol/${STORAGE_POOL}/data/${VDB_ZVOL} 2>/dev/null | grep -c TYPE" || echo "0")
+    if [[ "$VDB_HAS_DATA" -gt 0 && "$FORCE" -eq 0 ]]; then
+      echo "  Skipping — vdb already has data (formatted filesystem)"
+      echo "  Use --force to overwrite existing data with PBS backup"
+      continue
+    elif [[ "$VDB_HAS_DATA" -gt 0 && "$FORCE" -eq 1 ]]; then
+      echo "  WARNING: Overwriting existing filesystem on vdb (--force)"
+    fi
+  fi
 
   # Remove HA to prevent restart during restore
   echo "  Removing HA resource..."
@@ -201,8 +227,9 @@ for v in json.loads(sys.stdin.read()):
     sleep 5
   done
   if [[ "$VM_STATUS" != "stopped" ]]; then
-    echo "  WARNING: Could not stop VM ${VMID} — skipping restore"
+    echo "  FAILED: Could not stop VM ${VMID} — skipping restore"
     ssh_node "$HOSTING_IP" "ha-manager add vm:${VMID} --state started" || true
+    FAIL_COUNT=$((FAIL_COUNT + 1))
     continue
   fi
 
@@ -215,9 +242,10 @@ for v in json.loads(sys.stdin.read()):
   # Extract zvol name: "scsi1: vmstore:vm-500-disk-0,aio=..." → "vm-500-disk-0"
   TARGET_ZVOL=$(echo "$DISK_INFO" | grep "scsi1:" | sed "s/.*${STORAGE_POOL}://" | sed 's/,.*//')
   if [[ -z "$TARGET_ZVOL" ]]; then
-    echo "  WARNING: No scsi1 (data disk) found — skipping restore"
+    echo "  FAILED: No scsi1 (data disk) found — skipping restore"
     ssh_node "$HOSTING_IP" "qm start ${VMID}" || true
     ssh_node "$HOSTING_IP" "ha-manager add vm:${VMID} --state started" || true
+    FAIL_COUNT=$((FAIL_COUNT + 1))
     continue
   fi
   echo "  Target zvol: ${STORAGE_POOL}/${TARGET_ZVOL}"
@@ -225,9 +253,10 @@ for v in json.loads(sys.stdin.read()):
   # Restore backup to temp VM (9999) to extract the data disk
   echo "  Restoring backup to temp VM..."
   ssh_node "$HOSTING_IP" "qmrestore '${LATEST_VOLID}' 9999 --force --start 0" || {
-    echo "  WARNING: qmrestore failed — skipping"
+    echo "  FAILED: qmrestore failed — skipping"
     ssh_node "$HOSTING_IP" "qm start ${VMID}" || true
     ssh_node "$HOSTING_IP" "ha-manager add vm:${VMID} --state started" || true
+    FAIL_COUNT=$((FAIL_COUNT + 1))
     continue
   }
 
@@ -236,18 +265,24 @@ for v in json.loads(sys.stdin.read()):
   TEMP_SCSI1_ZVOL=$(echo "$TEMP_DISKS" | grep "scsi1:" | sed "s/.*${STORAGE_POOL}://" | sed 's/,.*//')
 
   if [[ -z "$TEMP_SCSI1_ZVOL" ]]; then
-    echo "  WARNING: No scsi1 in backup — skipping"
+    echo "  FAILED: No scsi1 in backup — skipping"
     ssh_node "$HOSTING_IP" "qm destroy 9999 --purge" || true
     ssh_node "$HOSTING_IP" "qm start ${VMID}" || true
     ssh_node "$HOSTING_IP" "ha-manager add vm:${VMID} --state started" || true
+    FAIL_COUNT=$((FAIL_COUNT + 1))
     continue
   fi
 
   # Copy the data disk from temp VM to target VM
   echo "  Copying data disk: ${TEMP_SCSI1_ZVOL} → ${TARGET_ZVOL}..."
-  ssh_node "$HOSTING_IP" "dd if=/dev/zvol/${STORAGE_POOL}/data/${TEMP_SCSI1_ZVOL} of=/dev/zvol/${STORAGE_POOL}/data/${TARGET_ZVOL} bs=4M status=none" || {
-    echo "  WARNING: dd failed — data disk may be corrupted"
-  }
+  if ! ssh_node "$HOSTING_IP" "dd if=/dev/zvol/${STORAGE_POOL}/data/${TEMP_SCSI1_ZVOL} of=/dev/zvol/${STORAGE_POOL}/data/${TARGET_ZVOL} bs=4M status=none"; then
+    echo "  FAILED: dd failed — data disk may be corrupted"
+    echo "  Temp VM 9999 preserved for manual recovery"
+    echo "  DO NOT start VM ${VMID} — vdb is in an unknown state"
+    ssh_node "$HOSTING_IP" "ha-manager add vm:${VMID} --state started" || true
+    FAIL_COUNT=$((FAIL_COUNT + 1))
+    continue
+  fi
 
   # Clean up temp VM
   ssh_node "$HOSTING_IP" "qm destroy 9999 --purge" || true
@@ -262,4 +297,8 @@ for v in json.loads(sys.stdin.read()):
 done
 
 echo ""
+if [[ $FAIL_COUNT -gt 0 ]]; then
+  echo "=== Restore INCOMPLETE: ${RESTORE_COUNT} restored, ${FAIL_COUNT} FAILED ==="
+  exit 1
+fi
 echo "=== Restore complete: ${RESTORE_COUNT} VM(s) restored ==="

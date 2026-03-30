@@ -11,6 +11,9 @@ terraform {
   }
 }
 
+# cicd is stateless — the runner holds no precious data of its own.
+# VM recreation requires re-running register-runner.sh but loses no state.
+# prevent_destroy is not needed. source = proxmox-vm (not proxmox-vm-precious).
 module "cicd" {
   source = "../proxmox-vm"
 

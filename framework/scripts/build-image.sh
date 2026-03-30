@@ -202,7 +202,7 @@ if [[ $EXTERNAL_MODE -eq 1 ]]; then
   fi
 
   # Hash the file content (SHA256, first 8 chars)
-  FILE_HASH=$(sha256sum "${IMG_FILES[0]}" | cut -c1-8)
+  FILE_HASH=$(shasum -a 256 "${IMG_FILES[0]}" | cut -c1-8)
 
   if [[ $DEV_MODE -eq 1 ]]; then
     OUTPUT_NAME="${ROLE}-${FILE_HASH}-dev.img"

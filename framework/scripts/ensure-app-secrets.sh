@@ -21,6 +21,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 CONFIG="${REPO_DIR}/site/config.yaml"
+APPS_CONFIG="${REPO_DIR}/site/applications.yaml"
 SECRETS="${REPO_DIR}/site/sops/secrets.yaml"
 
 # --- Find SOPS age key (same logic as tofu-wrapper.sh) ---
@@ -66,12 +67,12 @@ ensure_secret() {
 echo "Checking application secrets..."
 
 # --- InfluxDB ---
-if yq -e '.applications.influxdb.enabled == true' "$CONFIG" &>/dev/null; then
+if yq -e '.applications.influxdb.enabled == true' "$APPS_CONFIG" &>/dev/null; then
   ensure_secret "influxdb_admin_token" "InfluxDB admin API token"
 fi
 
 # --- Grafana ---
-if yq -e '.applications.grafana.enabled == true' "$CONFIG" &>/dev/null; then
+if yq -e '.applications.grafana.enabled == true' "$APPS_CONFIG" &>/dev/null; then
   ensure_secret "grafana_influxdb_token" "Grafana InfluxDB datasource token"
   # grafana_admin_password is also needed but may be prompted or
   # auto-generated differently — check if it exists

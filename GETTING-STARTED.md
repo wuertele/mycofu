@@ -22,6 +22,167 @@ operations after setup, see [OPERATIONS.md](OPERATIONS.md).
 
 ---
 
+## Before You Start
+
+Mycofu has real prerequisites — things you need to have in place before the
+automated parts can run. This section tells you exactly what each one is, why
+it's required, and what to do if you don't have it yet. Budget time for these
+upfront: the automated rebuild itself takes 30 minutes, but the environmental
+setup can take a few hours if you're starting from scratch.
+
+### A VLAN-capable network
+
+**What it is:** VLANs let one physical network carry multiple isolated virtual
+networks. Mycofu uses three: management (for Proxmox cluster traffic and
+workstation access), prod (for production VMs), and dev (for development VMs).
+Your gateway router and any managed switch connecting the Proxmox nodes must
+support VLANs.
+
+**Why it's required:** The dev/prod separation that Mycofu provides is enforced
+by the network — dev and prod VMs are physically isolated, not just configured
+differently. Without VLANs, you don't have a dev/prod boundary; you have a
+naming convention. That's the problem Mycofu is designed to solve. The
+management VLAN is equally essential: it carries Proxmox cluster heartbeats,
+OpenTofu API calls, and NAS access — all on a network that is separate from
+your application traffic.
+
+**What "VLAN-capable" means in practice:**
+- Your router/gateway can create VLANs with separate subnets and firewall rules.
+  UniFi, pfSense, OPNsense, and most prosumer/SMB routers support this. Consumer
+  routers (most ISP-provided devices) generally do not.
+- Any switch between the router and the Proxmox nodes must support "VLAN trunking"
+  — carrying multiple tagged VLANs on the same cable. Unmanaged switches (with
+  no web UI) cannot do this. Most managed switches sold for home lab use can.
+
+**If you don't have this:** A UniFi Express (~$80) or UniFi Cloud Gateway Ultra
+(~$130) paired with any managed switch works well and is the Tier 1 tested
+platform. pfSense or OPNsense running on a spare PC is a free alternative if
+you have the hardware.
+
+**Time to set up:** 30–60 minutes once you have the hardware.
+
+---
+
+### A registered domain name
+
+**What it is:** A domain name you own and control — something like
+`myhome.net` or `smithfamily.io`. You register these through a domain
+registrar (Cloudflare, Namecheap, IONOS, etc.) for $10–$15/year.
+
+**Why it's required:** Mycofu uses real TLS certificates from Let's Encrypt
+for every service. Let's Encrypt requires you to prove you own the domain by
+creating DNS records — this is the DNS-01 challenge. Without a real domain,
+you can't get real certificates. Without real certificates, the chain of trust
+that connects VMs to Vault doesn't work.
+
+**A few things worth knowing:**
+- The domain does not need a public-facing website. You can use it
+  entirely for internal cluster services while keeping your home network
+  private. The only public exposure is DNS port 53 (UDP+TCP) forwarded
+  to your prod DNS VM — no HTTP/HTTPS ports need to be open.
+- You only delegate a subdomain (`prod.yourdomain.com`), not the entire
+  domain. Your registrar keeps control of email records (MX, SPF, DMARC).
+- DNS delegation propagates through the internet's DNS system, which can
+  take up to 48 hours. In practice it's usually under an hour, but plan
+  for this before running `rebuild-cluster.sh` for the first time.
+- The `acme: internal` mode in config.yaml lets you use a self-signed CA
+  for early testing — certificates won't be trusted by browsers, but the
+  full chain of trust works internally. Switch to `acme: production` when
+  you're ready for real certificates. This avoids Let's Encrypt rate limits
+  (50 certs per domain per week) during initial bringup.
+
+**If you don't have this:** Register a domain with Cloudflare Registrar
+(at-cost pricing, no markup) or any other registrar. Cloudflare DNS hosting
+is free and has native certbot support for the DNS-01 challenge.
+
+**Time to set up:** 10 minutes to register. DNS delegation propagation takes
+up to 48 hours (plan for this, even if it resolves faster in practice).
+
+---
+
+### Port 53 forwarding from your public IP
+
+**What it is:** Your home router forwards incoming DNS queries (UDP and TCP,
+port 53) from the internet to your prod DNS VM on port 8053.
+
+**Why it's required:** Let's Encrypt validates your domain ownership by querying
+your DNS servers over the public internet. Your PowerDNS VM needs to be reachable
+from Let's Encrypt's validators to complete the DNS-01 challenge and issue
+certificates.
+
+**What this means in practice:** You need a static or stable public IP, or a
+dynamic DNS service if your ISP assigns a changing IP. The port forward is a
+single rule in your router: WAN port 53 → prod dns1 IP port 8053. No other
+ports need to be open.
+
+**If your ISP blocks port 53:** Some ISPs block inbound port 53. If yours does,
+the `acme: internal` mode lets you start without a public DNS setup — you can
+add it later when you're ready for production certificates.
+
+**Time to set up:** 5 minutes (one firewall rule) once your router supports it.
+
+---
+
+### An off-cluster NAS
+
+**What it is:** A separate storage device — a NAS appliance (Synology, TrueNAS)
+or a Linux machine with drives — that lives outside your Proxmox cluster. It
+needs to run two services: PostgreSQL (for OpenTofu state) and NFS (for PBS
+backup storage).
+
+**Why it's required:** OpenTofu state must survive a cluster failure — if it
+lived on the cluster, you'd lose the ability to rebuild the cluster from state
+when the cluster is down, which is precisely when you need it. PBS backup data
+must be off-cluster for the same reason: a backup stored on the same machines
+it backs up doesn't survive catastrophic failure.
+
+**What "off-cluster" means:** Any machine that is not a Proxmox node. A spare
+PC, an old laptop, a Raspberry Pi 4 with USB storage, or a NAS appliance all
+work. The machine should be reliable and always-on, since backup jobs run
+nightly.
+
+**Minimum requirements:**
+- PostgreSQL 14+ (most platforms have a package or Docker image)
+- NFS server with a shared folder exported with `no_root_squash`
+- Docker (for the sentinel monitoring container)
+- Accessible from your management subnet
+
+**If you have a Synology NAS:** PostgreSQL is available via the Package Center.
+The bringup checklist covers the exact configuration steps for DSM.
+
+**If you don't have a NAS:** A Linux machine (Ubuntu, Debian, NixOS) with
+PostgreSQL, NFS, and Docker installed works identically. This is a good use for
+a spare PC. The bringup checklist covers this path too.
+
+**Time to set up:** 30–90 minutes, depending on whether PostgreSQL and NFS are
+already installed on your platform.
+
+---
+
+### Summary: what to have ready before running rebuild-cluster.sh
+
+| Prerequisite | Required? | Can defer? |
+|---|---|---|
+| VLAN-capable gateway and switch | Yes | No — the dev/prod boundary depends on it |
+| Registered domain name | Yes | No — needed for TLS certificates |
+| DNS delegation configured at registrar | Yes | Can use `acme: internal` mode initially, switch later |
+| Port 53 forwarding on your router | Yes | Can use `acme: internal` mode initially, switch later |
+| Off-cluster NAS with PostgreSQL + NFS | Yes | No — OpenTofu state and backups must be off-cluster |
+| Proxmox installed on all nodes | Yes | No — the rebuild script starts from bare Proxmox |
+
+The "Can defer" column is honest: `acme: internal` mode lets you build the
+cluster and test everything internally without public DNS or port forwarding.
+When you're ready for production certificates, switch to `acme: production`,
+set up DNS delegation, and re-run `rebuild-cluster.sh`. Everything else
+rebuilds from the same configuration.
+
+The bringup generator (Step 4) produces a step-by-step checklist tailored
+to your specific hardware for each of these items. Run it after filling in
+`site/config.yaml` to get concrete instructions with your actual IPs,
+VLAN IDs, and platform-specific UI steps.
+
+---
+
 ## Step 1: Install Workstation Tools
 
 The following tools must be available in `$PATH` on your workstation:
@@ -55,17 +216,25 @@ Run the site generator:
 framework/scripts/new-site.sh
 ```
 
-This creates the entire `site/` directory from `framework/templates/`,
+This creates the `site/` directory from `framework/templates/`,
 including:
 
-- `site/config.yaml` — your site configuration (the only file you edit)
+- `site/config.yaml` — cluster topology and framework VM configuration
+- `site/applications.yaml` — application VM specifications (initially empty;
+  populated by `enable-app.sh` or written directly by the operator)
 - `site/nix/hosts/*.nix` — NixOS host configs for each VM role
 - `site/tofu/` — OpenTofu root module that instantiates framework modules
 - `site/apps/` — application configuration files
 - `site/dns/zones/` — extra DNS records (MX, TXT, etc.)
 - `site/images.yaml` — site-specific VM roles (for adding your own applications)
 
-The config.yaml has all auto-generatable fields pre-filled:
+These are your files. `new-site.sh` gives you a starting point — correct
+defaults, pre-generated MACs and IPs, inline documentation. The framework
+reads from these files directly; you are welcome to edit any of them at any
+time without running a generator first. If you understand the format, you
+can write entries by hand and they work identically.
+
+The `config.yaml` has all auto-generatable fields pre-filled:
 
 - **VM MAC addresses** — random locally-administered MACs (`02:xx` format),
   one per VM per environment
@@ -75,8 +244,9 @@ The config.yaml has all auto-generatable fields pre-filled:
 - **Sensible defaults** for all optional fields
 - **`# REQUIRED:`** markers on every field you need to fill in
 
-The script is safe to re-run — it exits with a warning if `site/config.yaml`
-already exists.
+The script never modifies files that already exist — re-running it is always
+safe. If `site/config.yaml` is present, the script exits with a warning and
+touches nothing.
 
 **Templates:** The source templates live in `framework/templates/`. If you
 want to understand what `new-site.sh` generates, examine
@@ -398,11 +568,32 @@ git remote add github <your-github-url>
 
 Your cluster is operational. From here:
 
-- **Add applications** — see the `applications` section in config.yaml and
-  `framework/catalog/` for available applications (InfluxDB, Grafana, Roon,
-  etc.). Enable an application by uncommenting its block in config.yaml and
-  pushing through the pipeline. No CI file changes needed — the pipeline
-  auto-discovers enabled applications.
+- **Add applications** — use `enable-app.sh` to add catalog applications
+  (InfluxDB, Grafana, Roon, etc.):
+
+  ```bash
+  framework/scripts/enable-app.sh influxdb
+  ```
+
+  This allocates VMIDs, IPs, and MACs; writes a complete entry to
+  `site/applications.yaml`; and generates NixOS host configs and application
+  config stubs in `site/apps/<app>/`. Review the generated entry in
+  `site/applications.yaml` and adjust any values. **Then edit the config
+  files before building** — generated files contain `CHANGEME` placeholders
+  for values only you can provide (organization name, bucket name, admin
+  password, etc.). The build will fail with an assertion error if any
+  `CHANGEME` values remain.
+
+  After reviewing and editing, commit and push through the pipeline:
+
+  ```bash
+  git add site/
+  git commit -m "enable influxdb"
+  git push gitlab dev
+  ```
+
+  Each catalog application has a README at `framework/catalog/<app>/README.md`
+  explaining what the config values mean and what to set them to.
 - **Push changes via the pipeline** — `git push gitlab dev` deploys to dev;
   merge to `prod` deploys to prod
 - **Review the operational cadence** — [OPERATIONS.md](OPERATIONS.md) covers
@@ -501,6 +692,13 @@ provides fault isolation for corosync.
 - Ensure you ran `git add site/ && git commit` before the rebuild. The
   Nix flake uses the git tree as its source — untracked files in `site/`
   are invisible to the builder. This is the most common first-time mistake.
+
+**Image build fails with "Failed assertions" and "contains placeholder values":**
+- An application config file in `site/apps/<app>/` still has `CHANGEME`
+  placeholders. Edit the file, replace all `CHANGEME` values with your
+  actual configuration, commit, and re-run. Check all enabled app config
+  files before re-running — the build stops at the first assertion, so
+  there may be more in other apps.
 
 **Backups fail at step 18:**
 - Check that the NFS export is accessible from the PBS VM

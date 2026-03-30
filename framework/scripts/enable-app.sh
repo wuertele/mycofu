@@ -5,20 +5,25 @@
 #   framework/scripts/enable-app.sh <app-name>
 #
 # Generates site-side files from the catalog template:
+#   - applications.<app> entry in site/applications.yaml
 #   - site/nix/hosts/<app>.nix (from host.nix.template)
 #   - site/apps/<app>/ (from config.example/, with .example suffix stripped)
-#   - applications.<app> entry in site/config.yaml
+#
+# No interactive prompts — all values are derived from the catalog and
+# existing allocations. The operator reviews and adjusts the generated
+# applications.yaml entry directly.
 #
 # Prerequisites:
 #   - framework/catalog/<app>/ exists
 #
-# Idempotent: if files already exist, prints "already enabled" and exits.
+# Idempotent: if entry already exists in applications.yaml, prints status and exits.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 CONFIG="${REPO_DIR}/site/config.yaml"
+APPS_CONFIG="${REPO_DIR}/site/applications.yaml"
 
 if [[ $# -lt 1 ]]; then
   echo "Usage: $(basename "$0") <app-name>" >&2
@@ -46,25 +51,46 @@ if [[ ! -d "$CATALOG_DIR" ]]; then
   exit 1
 fi
 
-# Check host template exists
-if [[ ! -f "${CATALOG_DIR}/host.nix.template" ]]; then
-  echo "ERROR: ${CATALOG_DIR}/host.nix.template not found" >&2
-  exit 1
+# Check host template exists (optional — boilerplate generated if missing)
+HAS_HOST_TEMPLATE=0
+if [[ -f "${CATALOG_DIR}/host.nix.template" ]]; then
+  HAS_HOST_TEMPLATE=1
 fi
 
-# Check if already enabled
+# Check if already enabled — primary check: applications.yaml
+if [[ -f "$APPS_CONFIG" ]]; then
+  APP_IN_APPS=$(yq -r ".applications.${APP} // \"\"" "$APPS_CONFIG" 2>/dev/null)
+  if [[ -n "$APP_IN_APPS" && "$APP_IN_APPS" != "null" ]]; then
+    echo "Already enabled: ${APP}"
+    echo "  Config:      site/applications.yaml applications.${APP}"
+    echo "  Host config: ${HOST_NIX}"
+    echo "  App config:  ${APP_DIR}/"
+    exit 0
+  fi
+fi
+
+# Secondary check: host .nix exists but no applications.yaml entry (migration case)
 if [[ -f "$HOST_NIX" ]]; then
+  APP_IN_OLD=$(yq -r ".applications.${APP} // \"\"" "$CONFIG" 2>/dev/null)
+  if [[ -n "$APP_IN_OLD" && "$APP_IN_OLD" != "null" ]]; then
+    echo "Already enabled: ${APP} (needs migration)"
+    echo ""
+    echo "  This app has an entry in site/config.yaml but not in site/applications.yaml."
+    echo "  Migrate it manually:"
+    echo "    1. Copy the .applications.${APP} block from site/config.yaml to site/applications.yaml"
+    echo "    2. Remove the .applications.${APP} block from site/config.yaml"
+    echo "    3. Run validate-site-config.sh to verify"
+    exit 0
+  fi
   echo "Already enabled: ${APP}"
   echo "  Host config: ${HOST_NIX}"
-  echo "  App config:  ${APP_DIR}/"
-  # Check if in config.yaml
-  APP_IN_CONFIG=$(yq -r ".applications.${APP} // \"\"" "$CONFIG" 2>/dev/null)
-  if [[ -n "$APP_IN_CONFIG" && "$APP_IN_CONFIG" != "null" ]]; then
-    echo "  Config:      site/config.yaml applications.${APP}"
-  else
-    echo "  WARNING: Not in site/config.yaml applications block"
-  fi
+  echo "  WARNING: No entry in site/applications.yaml or site/config.yaml"
   exit 0
+fi
+
+# Validate config consistency before making changes
+if [[ -x "${SCRIPT_DIR}/validate-site-config.sh" ]]; then
+  "${SCRIPT_DIR}/validate-site-config.sh" || exit 1
 fi
 
 # Check required tools
@@ -91,63 +117,59 @@ ENVS=$(yq -r '.environments | keys | .[]' "$CONFIG")
 
 # Generate MACs for each environment
 # (uses eval for dynamic vars — macOS bash 3.2 lacks declare -A)
-echo "Generated MAC addresses:"
 for ENV in $ENVS; do
   MAC=$(generate_mac)
   eval "ENV_MAC_${ENV}=\"${MAC}\""
-  echo "  ${ENV}: ${MAC}"
 done
-echo ""
 
-# --- Smart defaults ---
+# --- Read catalog defaults ---
 
-# Find the next available IP in each environment subnet
-find_next_ip() {
-  local env="$1"
-  local subnet
-  subnet=$(yq -r ".environments.${env}.subnet" "$CONFIG")
-  # Extract base (e.g., 172.27.10) from subnet like 172.27.10.0/24
-  local base
-  base=$(echo "$subnet" | sed 's/\.[0-9]*\/[0-9]*//')
+DEFAULT_RAM=1024
+DEFAULT_CORES=2
+DEFAULT_DISK=4
+DEFAULT_DATA_DISK=4
 
-  # Collect all used IPs in this subnet from vms and applications
-  local used_ips
-  used_ips=$(yq -r "
-    [
-      (.vms // {} | to_entries[].value.ip),
-      (.applications // {} | to_entries[].value.environments.${env}.ip // empty)
-    ] | flatten | .[]
-  " "$CONFIG" 2>/dev/null | grep "^${base}\." | sort -t. -k4 -n)
+# Override from variables.tf defaults if present
+if [[ -f "${CATALOG_DIR}/variables.tf" ]]; then
+  _ram=$(grep -A2 'variable "ram_mb"' "${CATALOG_DIR}/variables.tf" | grep 'default' | grep -o '[0-9]*' | head -1 || true)
+  [[ -n "$_ram" ]] && DEFAULT_RAM=$_ram
+  _cores=$(grep -A2 'variable "cores"' "${CATALOG_DIR}/variables.tf" | grep 'default' | grep -o '[0-9]*' | head -1 || true)
+  [[ -n "$_cores" ]] && DEFAULT_CORES=$_cores
+  _vdb=$(grep -A2 'variable "vdb_size_gb"' "${CATALOG_DIR}/variables.tf" | grep 'default' | grep -o '[0-9]*' | head -1 || true)
+  [[ -n "$_vdb" ]] && DEFAULT_DATA_DISK=$_vdb
+fi
 
-  # Find the highest used IP in range 50-254 and offer next
-  local highest=54
-  while IFS= read -r ip; do
-    local last_octet
-    last_octet=$(echo "$ip" | awk -F. '{print $4}')
-    if [[ "$last_octet" -gt "$highest" && "$last_octet" -lt 255 ]]; then
-      highest=$last_octet
-    fi
-  done <<< "$used_ips"
+# Derive backup flag: true if the app has a data disk (vdb > 0)
+if [[ "$DEFAULT_DATA_DISK" -gt 0 ]]; then
+  DEFAULT_BACKUP=true
+else
+  DEFAULT_BACKUP=false
+fi
 
-  echo "${base}.$((highest + 1))"
-}
+# Health endpoint from catalog
+HEALTH_PORT=""
+HEALTH_PATH=""
+if [[ -f "${CATALOG_DIR}/health.yaml" ]]; then
+  HEALTH_PORT=$(yq -r '.port // ""' "${CATALOG_DIR}/health.yaml")
+  HEALTH_PATH=$(yq -r '.path // ""' "${CATALOG_DIR}/health.yaml")
+  DEFAULT_MONITOR=true
+else
+  DEFAULT_MONITOR=false
+fi
 
-# Round-robin node selection based on current VM count
+# --- Node selection ---
+
 find_best_node() {
   local node_names
   node_names=$(yq -r '.nodes[].name' "$CONFIG")
 
-  # Count VMs per node from vms + applications
   local best_node=""
   local best_count=999999
   for node in $node_names; do
-    local count
-    count=$(yq -r "
-      [
-        (.vms // {} | to_entries[] | select(.value.node == \"${node}\") | .key),
-        (.applications // {} | to_entries[] | select(.value.node == \"${node}\") | .key)
-      ] | flatten | length
-    " "$CONFIG" 2>/dev/null || echo 0)
+    local vms_count apps_count count
+    vms_count=$(yq -r "[.vms // {} | to_entries[] | select(.value.node == \"${node}\")] | length" "$CONFIG" 2>/dev/null || echo 0)
+    apps_count=$(yq -r "[.applications // {} | to_entries[] | select(.value.node == \"${node}\")] | length" "$APPS_CONFIG" 2>/dev/null || echo 0)
+    count=$((vms_count + apps_count))
     if [[ "$count" -lt "$best_count" ]]; then
       best_count=$count
       best_node=$node
@@ -156,108 +178,181 @@ find_best_node() {
   echo "$best_node"
 }
 
-# Read catalog defaults
-DEFAULT_RAM=1024
-DEFAULT_DISK=4
-DEFAULT_DATA_DISK=4
-DEFAULT_BACKUP=false
-DEFAULT_MONITOR=true
+# --- Allocate IPs ---
+# Allocates a single fourth-octet value that is unused across ALL environment
+# subnets. This keeps the fourth octet consistent between prod and dev
+# (e.g., influxdb is .55 in both), making VMs easy to identify by IP.
 
-# Override from variables.tf defaults if present
-if [[ -f "${CATALOG_DIR}/variables.tf" ]]; then
-  _ram=$(grep -A2 'variable "ram_mb"' "${CATALOG_DIR}/variables.tf" | grep 'default' | grep -o '[0-9]*' | head -1 || true)
-  [[ -n "$_ram" ]] && DEFAULT_RAM=$_ram
-  _vdb=$(grep -A2 'variable "vdb_size_gb"' "${CATALOG_DIR}/variables.tf" | grep 'default' | grep -o '[0-9]*' | head -1 || true)
-  [[ -n "$_vdb" ]] && DEFAULT_DATA_DISK=$_vdb
-fi
+find_next_octet() {
+  # Collect all used fourth octets from all environments in both files
+  local all_octets=""
 
-# Set monitor default based on whether the catalog app has a health endpoint.
-# Health port/path are defined in framework/catalog/<app>/health.yaml.
-if [[ ! -f "${CATALOG_DIR}/health.yaml" ]]; then
-  DEFAULT_MONITOR=false
-fi
+  for env in $ENVS; do
+    local subnet base
+    subnet=$(yq -r ".environments.${env}.subnet" "$CONFIG")
+    base=$(echo "$subnet" | sed 's/\.[0-9]*\/[0-9]*//')
 
-# Prompt with defaults
-DEFAULT_NODE=$(find_best_node)
-read -rp "Node [${DEFAULT_NODE}]: " INPUT_NODE
-NODE="${INPUT_NODE:-${DEFAULT_NODE}}"
+    local vms_ips apps_ips
+    vms_ips=$(yq -r '(.vms // {} | to_entries[].value.ip)' "$CONFIG" 2>/dev/null | grep "^${base}\." || true)
+    apps_ips=$(yq -r ".applications // {} | to_entries[].value.environments.${env}.ip" "$APPS_CONFIG" 2>/dev/null | grep "^${base}\." || true)
+
+    local ips
+    ips=$(echo -e "${vms_ips}\n${apps_ips}" | grep -v '^$')
+    while IFS= read -r ip; do
+      [[ -z "$ip" ]] && continue
+      all_octets="${all_octets} $(echo "$ip" | awk -F. '{print $4}')"
+    done <<< "$ips"
+  done
+
+  # Also check management network IPs (shared VMs like gitlab, cicd, pbs)
+  local mgmt_ips
+  mgmt_ips=$(yq -r '.vms | to_entries[].value.ip' "$CONFIG" 2>/dev/null || true)
+  while IFS= read -r ip; do
+    [[ -z "$ip" ]] && continue
+    all_octets="${all_octets} $(echo "$ip" | awk -F. '{print $4}')"
+  done <<< "$mgmt_ips"
+
+  # Find the lowest unused octet starting from 55 (50-54 reserved for framework VMs)
+  for octet in $(seq 55 99); do
+    if ! echo "$all_octets" | tr ' ' '\n' | grep -qw "$octet"; then
+      echo "$octet"
+      return 0
+    fi
+  done
+
+  echo "ERROR: No available IP octet in .55-.99 range" >&2
+  return 1
+}
+
+# --- Allocate VMIDs ---
+
+allocate_vmid() {
+  # VMID scheme: 5xx = dev apps, 6xx = prod apps
+  # Same role offset across dev/prod (e.g., offset 01 → 501 dev, 601 prod)
+
+  # Collect all used VMIDs from both files
+  local used_vmids
+  used_vmids=$(yq -r '.vms | to_entries[].value.vmid' "$CONFIG" 2>/dev/null || true)
+  local app_vmids
+  app_vmids=$(yq -r '.applications // {} | to_entries[].value.environments[].vmid' "$APPS_CONFIG" 2>/dev/null || true)
+  used_vmids=$(echo -e "${used_vmids}\n${app_vmids}" | grep -v '^$' | sort -n)
+
+  # Find the next available offset (01-99) where neither 5xx nor 6xx is taken
+  for offset in $(seq 1 99); do
+    local dev_vmid=$((500 + offset))
+    local prod_vmid=$((600 + offset))
+    if ! echo "$used_vmids" | grep -qw "$dev_vmid" && ! echo "$used_vmids" | grep -qw "$prod_vmid"; then
+      echo "${dev_vmid} ${prod_vmid}"
+      return 0
+    fi
+  done
+
+  echo "ERROR: No available VMID offset in 5xx/6xx range" >&2
+  return 1
+}
+
+# --- Compute all values ---
+
+NODE=$(find_best_node)
+
+# Allocate a single fourth octet used in all environments
+APP_OCTET=$(find_next_octet) || exit 1
 
 for ENV in $ENVS; do
-  DEFAULT_IP=$(find_next_ip "$ENV")
   SUBNET=$(yq -r ".environments.${ENV}.subnet" "$CONFIG")
-  ENV_LABEL=$(echo "$ENV" | awk '{print toupper(substr($0,1,1)) substr($0,2)}')
-  read -rp "${ENV_LABEL} IP (${SUBNET}) [${DEFAULT_IP}]: " INPUT_IP
-  eval "ENV_IP_${ENV}=\"${INPUT_IP:-${DEFAULT_IP}}\""
+  BASE=$(echo "$SUBNET" | sed 's/\.[0-9]*\/[0-9]*//')
+  eval "ENV_IP_${ENV}=\"${BASE}.${APP_OCTET}\""
 done
 
-read -rp "RAM (MB) [${DEFAULT_RAM}]: " INPUT_RAM
-RAM="${INPUT_RAM:-${DEFAULT_RAM}}"
+VMID_PAIR=$(allocate_vmid) || exit 1
+DEV_VMID=$(echo "$VMID_PAIR" | awk '{print $1}')
+PROD_VMID=$(echo "$VMID_PAIR" | awk '{print $2}')
 
-read -rp "Data disk (GB) [${DEFAULT_DATA_DISK}]: " INPUT_DISK
-DATA_DISK="${INPUT_DISK:-${DEFAULT_DATA_DISK}}"
+# Read subnet ranges for inline comments
+PROD_SUBNET=$(yq -r '.environments.prod.subnet' "$CONFIG")
+DEV_SUBNET=$(yq -r '.environments.dev.subnet' "$CONFIG")
+PROD_BASE=$(echo "$PROD_SUBNET" | sed 's/\.[0-9]*\/[0-9]*//')
+DEV_BASE=$(echo "$DEV_SUBNET" | sed 's/\.[0-9]*\/[0-9]*//')
 
-echo ""
+# --- Write to applications.yaml ---
 
-# --- Add to config.yaml ---
-# Build the YAML block to append
-APP_YAML="  ${APP}:
-    enabled: true
-    node: ${NODE}
-    ram: ${RAM}
-    disk_size: ${DEFAULT_DISK}
-    data_disk_size: ${DATA_DISK}
-    backup: ${DEFAULT_BACKUP}
-    monitor: ${DEFAULT_MONITOR}
-    environments:"
+if [[ ! -f "$APPS_CONFIG" ]]; then
+  cat > "$APPS_CONFIG" << 'APPSEOF'
+# site/applications.yaml — see enable-app.sh
 
-for ENV in $ENVS; do
-  APP_YAML="${APP_YAML}
-      ${ENV}:
-        ip: $(eval echo \"\$ENV_IP_${ENV}\")
-        mac: \"$(eval echo \"\$ENV_MAC_${ENV}\")\""
-done
+applications: {}
+APPSEOF
+fi
 
-# Check if applications: block exists
-if yq -e '.applications' "$CONFIG" >/dev/null 2>&1; then
-  # Append to existing applications block using yq
-  # Create a temp file with the new app entry
-  TEMP_YAML=$(mktemp)
-  cat > "$TEMP_YAML" <<YAMLEOF
+TEMP_YAML=$(mktemp)
+cat > "$TEMP_YAML" <<YAMLEOF
 enabled: true
 node: ${NODE}
-ram: ${RAM}
+ram: ${DEFAULT_RAM}
+cores: ${DEFAULT_CORES}
 disk_size: ${DEFAULT_DISK}
-data_disk_size: ${DATA_DISK}
+data_disk_size: ${DEFAULT_DATA_DISK}
 backup: ${DEFAULT_BACKUP}
 monitor: ${DEFAULT_MONITOR}
 environments:
+  prod:
+    ip: $(eval echo \"\$ENV_IP_prod\")
+    vmid: ${PROD_VMID}
+    mac: "$(eval echo \"\$ENV_MAC_prod\")"
+  dev:
+    ip: $(eval echo \"\$ENV_IP_dev\")
+    vmid: ${DEV_VMID}
+    mac: "$(eval echo \"\$ENV_MAC_dev\")"
 YAMLEOF
-  for ENV in $ENVS; do
-    cat >> "$TEMP_YAML" <<YAMLEOF
-  ${ENV}:
-    ip: $(eval echo \"\$ENV_IP_${ENV}\")
-    mac: "$(eval echo \"\$ENV_MAC_${ENV}\")"
-YAMLEOF
-  done
 
-  yq -i ".applications.${APP} = load(\"${TEMP_YAML}\")" "$CONFIG"
-  rm -f "$TEMP_YAML"
-else
-  echo "" >> "$CONFIG"
-  echo "applications:" >> "$CONFIG"
-  echo "$APP_YAML" >> "$CONFIG"
+# Add health endpoint if catalog defines one
+if [[ -n "$HEALTH_PORT" && "$HEALTH_PORT" != "null" ]]; then
+  echo "health_port: ${HEALTH_PORT}" >> "$TEMP_YAML"
+fi
+if [[ -n "$HEALTH_PATH" && "$HEALTH_PATH" != "null" ]]; then
+  echo "health_path: \"${HEALTH_PATH}\"" >> "$TEMP_YAML"
 fi
 
-echo "Added to site/config.yaml:"
-echo "  applications.${APP}"
-for ENV in $ENVS; do
-  echo "    ${ENV}: IP $(eval echo \"\$ENV_IP_${ENV}\"), MAC $(eval echo \"\$ENV_MAC_${ENV}\")"
-done
-echo ""
+yq -i ".applications.${APP} = load(\"${TEMP_YAML}\")" "$APPS_CONFIG"
+rm -f "$TEMP_YAML"
+
+# Add inline comments to the generated block using yq comments
+# (yq doesn't support inline comments well, so we add key comments)
+yq -i ".applications.${APP}.node line_comment = \"least-loaded node\"" "$APPS_CONFIG"
+yq -i ".applications.${APP}.ram line_comment = \"MB; catalog default\"" "$APPS_CONFIG"
+yq -i ".applications.${APP}.disk_size line_comment = \"GB; root disk (vda), rebuilt from Git\"" "$APPS_CONFIG"
+yq -i ".applications.${APP}.data_disk_size line_comment = \"GB; data disk (vdb), backed up if backup: true\"" "$APPS_CONFIG"
+yq -i ".applications.${APP}.backup line_comment = \"true = PBS backs up vdb; derived from data_disk_size > 0\"" "$APPS_CONFIG"
+yq -i ".applications.${APP}.monitor line_comment = \"true = Gatus health-checks this app\"" "$APPS_CONFIG"
+yq -i ".applications.${APP}.environments.prod.ip line_comment = \"range: ${PROD_BASE}.50-${PROD_BASE}.99; verify: grep ip: site/config.yaml site/applications.yaml\"" "$APPS_CONFIG"
+yq -i ".applications.${APP}.environments.prod.vmid line_comment = \"6xx = prod apps; verify: grep vmid: site/config.yaml site/applications.yaml\"" "$APPS_CONFIG"
+yq -i ".applications.${APP}.environments.prod.mac line_comment = \"stable across rebuilds — layer 2 identity\"" "$APPS_CONFIG"
+yq -i ".applications.${APP}.environments.dev.ip line_comment = \"range: ${DEV_BASE}.50-${DEV_BASE}.99; verify: grep ip: site/config.yaml site/applications.yaml\"" "$APPS_CONFIG"
+yq -i ".applications.${APP}.environments.dev.vmid line_comment = \"5xx = dev apps; verify: grep vmid: site/config.yaml site/applications.yaml\"" "$APPS_CONFIG"
+yq -i ".applications.${APP}.environments.dev.mac line_comment = \"stable across rebuilds — layer 2 identity\"" "$APPS_CONFIG"
 
 # --- Generate host config ---
 echo "Creating ${HOST_NIX}..."
-cp "${CATALOG_DIR}/host.nix.template" "$HOST_NIX"
+if [[ $HAS_HOST_TEMPLATE -eq 1 ]]; then
+  cp "${CATALOG_DIR}/host.nix.template" "$HOST_NIX"
+else
+  cat > "$HOST_NIX" << NIXEOF
+# ${APP}.nix — NixOS host configuration for ${APP} VMs.
+#
+# Generated by enable-app.sh. Edit for site-specific customizations.
+
+{ ... }:
+
+{
+  imports = [
+    ../../../framework/nix/modules/base.nix
+    ../../../framework/catalog/${APP}/module.nix
+  ];
+
+  system.stateVersion = "24.11";
+}
+NIXEOF
+fi
 
 # --- Create app config directory and copy examples ---
 mkdir -p "$APP_DIR"
@@ -279,42 +374,49 @@ fi
 
 # --- Print summary ---
 echo ""
+echo "=========================================="
 echo "Enabled: ${APP}"
+echo "=========================================="
 echo ""
-echo "Created:"
+echo "Files created:"
+echo "  ${APPS_CONFIG} (applications.${APP} entry)"
 echo "  ${HOST_NIX}"
-for f in "${CREATED_FILES[@]}"; do
+for f in ${CREATED_FILES[@]+"${CREATED_FILES[@]}"}; do
   echo "  ${f}"
 done
-
-# --- DHCP reservation instructions ---
 echo ""
-echo "DHCP reservations needed (configure on your gateway):"
-for ENV in $ENVS; do
-  VLAN_ID=$(yq -r ".environments.${ENV}.vlan_id" "$CONFIG")
-  echo "  VLAN ${VLAN_ID} (${ENV}): MAC $(eval echo \"\$ENV_MAC_${ENV}\") → IP $(eval echo \"\$ENV_IP_${ENV}\")"
-done
-
-# --- Next steps ---
+echo "Allocated:"
+echo "  prod: VMID ${PROD_VMID}, IP $(eval echo \"\$ENV_IP_prod\")"
+echo "  dev:  VMID ${DEV_VMID}, IP $(eval echo \"\$ENV_IP_dev\")"
 echo ""
-echo "DNS A records are auto-derived from config.yaml — no manual zone edits needed."
+echo "MAC addresses are stable across rebuilds — they preserve layer 2"
+echo "identity on the network. IPs are static via CIDATA, not DHCP."
 echo ""
 echo "Next steps:"
-echo "  1. Configure DHCP reservations on your gateway (see above)"
+echo "  1. Review and adjust site/applications.yaml if needed"
 
-# App-specific config editing
-for f in "${CREATED_FILES[@]}"; do
-  fname="$(basename "$f")"
-  echo "  3. Edit ${f} (replace CHANGEME values)"
-done
+if [[ ${#CREATED_FILES[@]} -gt 0 ]]; then
+  echo "  2. Edit config files (replace any CHANGEME values):"
+  for f in ${CREATED_FILES[@]+"${CREATED_FILES[@]}"}; do
+    echo "       ${f}"
+  done
+fi
 
-echo "  4. Add secrets to SOPS:"
-echo "     sops --set '[\"${APP}_admin_password\"] \"your-password\"' site/sops/secrets.yaml"
-
-echo "  5. Add the flake output to flake.nix:"
-echo "     ${APP}-image = mkImage [ ./site/nix/hosts/${APP}.nix ];"
-echo "  6. Build: framework/scripts/build-image.sh site/nix/hosts/${APP}.nix ${APP}"
-echo "  7. Deploy: framework/scripts/tofu-wrapper.sh apply -target=module.${APP}_dev"
+echo "  3. Add any required secrets to SOPS"
+echo "  4. Add the flake output to flake.nix:"
+echo "       ${APP}-image = mkImage [ ./site/nix/hosts/${APP}.nix ];"
+echo "  5. Add the OpenTofu module instantiation to framework/tofu/root/main.tf."
+echo "     The module source for application VMs is always proxmox-vm — the"
+echo "     pipeline's automated backup+restore envelope handles safety for"
+echo "     stateful apps. proxmox-vm-precious is reserved for Tier 2"
+echo "     control-plane VMs (gitlab, cicd) that the pipeline cannot deploy:"
+echo "       source = \"../../tofu/modules/proxmox-vm\""
+if [[ "$DEFAULT_BACKUP" == "true" ]]; then
+  echo "  6. Add a data marker entry to framework/scripts/restore-after-deploy.sh"
+  echo "     for this app (uptime-based detection handles most cases, but verify"
+  echo "     the app name is recognized by the restore script)."
+fi
+echo "  7. Build the image and deploy via the pipeline"
 echo ""
 
 if [[ -f "${CATALOG_DIR}/README.md" ]]; then

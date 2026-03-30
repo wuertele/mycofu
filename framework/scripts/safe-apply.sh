@@ -10,8 +10,8 @@
 #   1. Runs tofu plan (all modules)
 #   2. Exports plan to JSON
 #   3. Categorizes every change by environment and protection status
-#   4. Blocks if control-plane modules would be destroyed
-#   5. Applies only modules belonging to the specified environment
+#   4. Warns if control-plane modules have drift (skips them)
+#   5. Applies only data-plane modules belonging to the specified environment
 #
 # Module categorization (by naming convention):
 #   Control-plane:  module.gitlab, module.cicd, module.pbs → workstation only
@@ -77,7 +77,7 @@ with open('$PLAN_JSON', 'w') as f:
 # --- Categorize changes ---
 set +e
 DEPLOY_ENV="$ENV" python3 -c "
-import sys, json, os
+import sys, json, os, re
 
 env = os.environ['DEPLOY_ENV']
 PROTECTED = {'module.gitlab', 'module.cicd', 'module.pbs'}
@@ -87,7 +87,7 @@ PROD_EXTRAS = {'module.gatus'}
 with open('$PLAN_JSON') as f:
     plan = json.load(f)
 
-blocked = []
+control_plane_drift = []
 deployable = []
 skipped = []
 
@@ -98,12 +98,13 @@ for rc in plan.get('resource_changes', []):
 
     addr = rc.get('address', '')
     mod = '.'.join(addr.split('.')[:2]) if '.' in addr else addr
+    # Strip count/for_each index (e.g., module.grafana_dev[0] → module.grafana_dev)
+    mod = re.sub(r'\[.*\]$', '', mod)
 
     if mod in PROTECTED:
         if 'delete' in actions or 'create' in actions:
-            blocked.append(f'  {addr}: {actions}')
-        else:
-            skipped.append(mod)
+            control_plane_drift.append(f'  {addr}: {actions}')
+        skipped.append(mod)
     elif mod.endswith(f'_{env}') or mod in (DEV_EXTRAS if env == 'dev' else PROD_EXTRAS):
         deployable.append(mod)
     else:
@@ -113,11 +114,10 @@ for rc in plan.get('resource_changes', []):
                 print(f'WARNING: module {mod} does not match any environment — skipping', file=sys.stderr)
         skipped.append(mod)
 
-if blocked:
-    print('BLOCKED')
-    for b in blocked:
-        print(b, file=sys.stderr)
-    sys.exit(1)
+if control_plane_drift:
+    print('CONTROL_PLANE_DRIFT')
+    for d in control_plane_drift:
+        print(d)
 
 # Output unique deployable modules (one per line)
 for mod in sorted(set(deployable)):
@@ -128,32 +128,36 @@ CATEGORIZE_EXIT=$?
 set -e
 
 # --- Handle results ---
-if [[ $CATEGORIZE_EXIT -eq 1 ]] && grep -q "^BLOCKED$" "$CATEGORIZE_OUT"; then
-  echo ""
-  echo "=================================================="
-  echo "PIPELINE BLOCKED: Control-plane VM change detected"
-  echo "=================================================="
-  echo ""
-  # Print the blocked details (everything except BLOCKED marker)
-  grep -v "^BLOCKED$" "$CATEGORIZE_OUT"
-  echo ""
-  echo "These are control-plane VMs (Tier 2) — deploy from the workstation:"
-  echo ""
-  echo "  framework/scripts/rebuild-cluster.sh --scope control-plane"
-  echo ""
-  echo "Or for specific VMs:"
-  echo "  framework/scripts/rebuild-cluster.sh --scope vm=gitlab,cicd"
-  exit 1
-elif [[ $CATEGORIZE_EXIT -ne 0 ]]; then
+if [[ $CATEGORIZE_EXIT -ne 0 ]]; then
   echo "ERROR: Plan categorization failed:"
   cat "$CATEGORIZE_OUT"
   exit 1
 fi
 
-# Extract -target flags from categorize output (skip WARNING lines)
+# --- Warn about control-plane drift (but don't block) ---
+# The pipeline can't deploy control-plane VMs (it runs on them).
+# The guard:control-plane CI job blocks prod MRs until drift is resolved.
+if grep -q "^CONTROL_PLANE_DRIFT$" "$CATEGORIZE_OUT"; then
+  echo ""
+  echo "=================================================="
+  echo "WARNING: Control-plane VMs need manual deployment"
+  echo "=================================================="
+  echo ""
+  grep -v "^CONTROL_PLANE_DRIFT$" "$CATEGORIZE_OUT" | grep -v "^module\." | grep -v "^WARNING:" | grep -v "^$" || true
+  echo ""
+  echo "Deploy from the workstation when ready:"
+  echo "  framework/scripts/rebuild-cluster.sh --scope control-plane"
+  echo ""
+  echo "DO NOT run 'tofu apply' directly on control-plane modules."
+  echo ""
+fi
+
+# Extract -target flags from categorize output (skip non-module lines)
 TARGETS=""
 while IFS= read -r line; do
   [[ "$line" == WARNING:* ]] && echo "$line" >&2 && continue
+  [[ "$line" == CONTROL_PLANE_DRIFT ]] && continue
+  [[ "$line" == "  "* ]] && continue  # drift detail lines (indented)
   [[ -z "$line" ]] && continue
   TARGETS="$TARGETS -target=$line"
 done < "$CATEGORIZE_OUT"
@@ -173,9 +177,12 @@ if [[ $DRY_RUN -eq 1 ]]; then
   exit 0
 fi
 
-# HA double-apply: when VMs are recreated, Proxmox removes the HA resource.
-# The first apply may fail on HA resource updates. A second apply creates them.
-if ! "${SCRIPT_DIR}/tofu-wrapper.sh" apply ${TARGETS} -auto-approve; then
-  echo "First apply had errors (likely HA resources) — running second apply..."
-  "${SCRIPT_DIR}/tofu-wrapper.sh" apply ${TARGETS} -auto-approve
-fi
+# HA double-apply: when VMs are recreated, the HA resource is removed by Proxmox.
+# The first apply creates VMs but can't create HA resources (VM must exist first).
+# The second apply picks up the missing HA resources. Always run both — the first
+# apply succeeds (VMs created) without error, so checking exit code is insufficient.
+"${SCRIPT_DIR}/tofu-wrapper.sh" apply ${TARGETS} -auto-approve
+
+echo ""
+echo "=== Second apply (HA resources) ==="
+"${SCRIPT_DIR}/tofu-wrapper.sh" apply ${TARGETS} -auto-approve

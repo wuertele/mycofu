@@ -96,6 +96,10 @@ in
       ];
       wants = [ "network-online.target" ];
       requires = [ "certbot-initial.service" ];
+      # vault binary requires getent at runtime for token helper path
+      # expansion. Without it: "exec: getent: executable file not found
+      # in $PATH" and vault-agent crash-loops indefinitely.
+      path = [ pkgs.glibc.bin ];
       serviceConfig = {
         Type = "simple";
         ExecStartPre = "+${agentConfigScript}";

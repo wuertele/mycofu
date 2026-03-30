@@ -92,17 +92,42 @@ for vm in dns1_prod dns2_prod vault_prod dns1_dev dns2_dev vault_dev pebble pbs 
   yq -i ".vms.${vm}.mac = \"${MAC}\"" "${SITE_DIR}/config.yaml"
 done
 
-# Generate MAC addresses for application VMs (any uncommented app with environments)
-for app in $(yq -r '.applications // {} | keys[]' "${SITE_DIR}/config.yaml" 2>/dev/null); do
-  for env in $(yq -r ".applications.${app}.environments // {} | keys[]" "${SITE_DIR}/config.yaml" 2>/dev/null); do
-    if yq -e ".applications.${app}.environments.${env}.mac" "${SITE_DIR}/config.yaml" &>/dev/null; then
+# Create empty applications.yaml for future app enablement via enable-app.sh
+APPS_YAML="${SITE_DIR}/applications.yaml"
+if [[ ! -f "$APPS_YAML" ]]; then
+  cat > "$APPS_YAML" << 'APPSEOF'
+# site/applications.yaml
+#
+# Application VM specifications. Each entry describes one application VM
+# that the framework manages on your cluster.
+#
+# This file is generated and maintained by the operator. Use enable-app.sh
+# to add a new application — it will append a complete, pre-filled entry
+# that you can review and adjust. After generation, this file is yours.
+#
+# DEPENDENCY: IP ranges and VMID ranges here are constrained by values in
+# site/config.yaml (subnets, VMID scheme). If you change subnets or VMID
+# ranges in config.yaml, update the inline range comments in this file.
+#
+# Framework VM configuration (DNS, Vault, PBS, GitLab, etc.) lives in
+# site/config.yaml, not here.
+
+applications: {}
+APPSEOF
+  echo "  Created ${APPS_YAML}"
+fi
+
+# Generate MAC addresses for application VMs (from applications.yaml)
+for app in $(yq -r '.applications // {} | keys[]' "$APPS_YAML" 2>/dev/null); do
+  for env in $(yq -r ".applications.${app}.environments // {} | keys[]" "$APPS_YAML" 2>/dev/null); do
+    if yq -e ".applications.${app}.environments.${env}.mac" "$APPS_YAML" &>/dev/null; then
       MAC=$(generate_mac)
-      yq -i ".applications.${app}.environments.${env}.mac = \"${MAC}\"" "${SITE_DIR}/config.yaml"
+      yq -i ".applications.${app}.environments.${env}.mac = \"${MAC}\"" "$APPS_YAML"
     fi
     # Also handle mgmt_nic MAC if present
-    if yq -e ".applications.${app}.environments.${env}.mgmt_nic.mac" "${SITE_DIR}/config.yaml" &>/dev/null; then
+    if yq -e ".applications.${app}.environments.${env}.mgmt_nic.mac" "$APPS_YAML" &>/dev/null; then
       MAC=$(generate_mac)
-      yq -i ".applications.${app}.environments.${env}.mgmt_nic.mac = \"${MAC}\"" "${SITE_DIR}/config.yaml"
+      yq -i ".applications.${app}.environments.${env}.mgmt_nic.mac = \"${MAC}\"" "$APPS_YAML"
     fi
   done
 done
@@ -124,6 +149,16 @@ fi
 
 echo "  Domain: ${DOMAIN}"
 echo "  MAC addresses: generated (locally administered range)"
+
+# --- Copy GitLab settings template ---
+echo ""
+echo "Generating site/gitlab.yaml..."
+if [[ ! -f "${SITE_DIR}/gitlab.yaml" ]]; then
+  cp "${TEMPLATE_DIR}/gitlab.yaml.example" "${SITE_DIR}/gitlab.yaml"
+  echo "  Copied from template (customize labels as needed)"
+else
+  echo "  Already exists — skipping"
+fi
 
 # --- Generate images.yaml ---
 echo ""
@@ -193,7 +228,6 @@ creation_rules:
 SOPS_EOF
 
 # --- Secrets created by bootstrap-sops.sh (not here) ---
-fi
 
 # --- Summary ---
 echo ""

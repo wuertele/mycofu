@@ -65,6 +65,19 @@ The companion **[README.md](README.md)** introduces the project — what it does
    - This eliminates the class of failures where "the software was tested but the configuration was different" — when you test a commit, you test everything
    - The only state not captured by the git commit is runtime data (Category 3: database contents, Vault leases, application state), which is explicitly classified as precious state and handled by the backup system
 
+11. **Files are the operator interface**
+    - YAML files are the primary surface through which the operator communicates intent to the framework. Programs read from files and write to files; they do not replace files as the interface.
+    - A well-structured YAML file with inline comments teaches the operator the system as they use it. A wizard collects values and hides the system from the operator. When the operator needs to change something, they go to the file — not to a program they ran once and forgot.
+    - **Generators are helpers, not gatekeepers.** `new-site.sh`, `enable-app.sh`, and similar scripts produce a starting point. The operator is the authority on the files they generate. A generator that has never been run is not a blocker — the operator can write `site/config.yaml` or `site/applications.yaml` by hand, and the framework works identically. Generators exist to save the operator from knowing every field and derivation rule on day one. They are not part of the framework's execution path.
+    - **Re-running a generator must be safe.** Generators write to new entries and never touch existing content. If an operator has edited a generated file and re-runs the generator for any reason, their edits must survive unchanged. This is a hard invariant, not an implementation detail. A generator that silently overwrites operator edits is a data-loss bug.
+    - **The framework must never fail because a generator was not run.** If `enable-app.sh` was never run and the operator wrote an app entry directly in `applications.yaml`, every consumer must work correctly. The framework reads files; it does not care how those files were produced.
+    - Generators write initial structure and own the accuracy of what they generate at generation time. Generated content becomes operator-maintained from the moment it is written. Comments belong at the point of action — adjacent to the values they constrain, not at the file header.
+
+10. **Automation output is operator instruction**
+    - When a script or CI job prints "run this command," the operator will run it. Every command printed by automation must be safe to copy-paste. If a command is dangerous (e.g., destroys precious-state VMs), the automation must either not print it, or route the operator through a safe path that handles backup and restore automatically.
+    - Scripts that detect a problem must suggest the safe remediation path, not the raw low-level operation. For example: a CI guard that detects control-plane image drift must direct the operator to `rebuild-cluster.sh --scope control-plane` (which handles backup, destroy, recreate, restore), not to a raw `tofu apply -target=module.gitlab` (which destroys data silently).
+    - The same duty of care applies to error messages, remediation instructions, and diagnostic output. If automation tells the operator to do something, it is responsible for the consequences of the operator doing it.
+
 ---
 
 ## 3. Non-Goals
@@ -652,13 +665,13 @@ with an operator-chosen DNS name:
 ```yaml
 roon_prod:
   vmid: 603
-  ip: "10.0.10.57"                # prod VLAN (primary NIC on vmbr0)
+  ip: "172.27.10.57"              # prod VLAN (primary NIC on vmbr0)
   mac: "02:xx:xx:xx:xx:xx"
   node: pve03
   backup: true
   mgmt_nic:
     name: "roon-mgmt"             # DNS: roon-mgmt.prod.example.com
-    ip: "10.0.0.67"               # management subnet (second NIC on vmbr1)
+    ip: "172.17.77.67"            # management subnet (second NIC on vmbr1)
     mac: "02:yy:yy:yy:yy:yy"
 ```
 
@@ -3459,6 +3472,98 @@ git push gitlab dev               # Dev pipeline runs
 7. Add GitLab as a remote, push both `dev` and `prod`
 8. Keep `main` tracking the public repo for framework updates
 
+### 12.8 Application Configuration Model
+
+**Decision:** Application VM specifications live in `site/applications.yaml`, separate from framework VM and cluster topology configuration in `site/config.yaml`.
+
+**Motivation:**
+
+Framework VMs (DNS, Vault, PBS, Gatus, GitLab, CI/CD runner) and application VMs (Grafana, InfluxDB, Roon, Home Assistant, etc.) are genuinely different objects with different ownership, different lifecycle, and different who-edits-this. An operator adding a new application does not need to navigate framework VM configuration, and should not have to. The split makes each file's scope self-evident.
+
+An application VM specification is a single logical object: node placement, resource allocation, per-environment addressing, and app-specific parameters. Spreading this object across multiple files — `config.yaml`, `site/nix/hosts/<app>.nix`, `flake.nix`, OpenTofu modules — makes the object implicit. The operator must hold the full object in their head by assembling pieces from multiple locations. `applications.yaml` makes the object explicit and contiguous.
+
+**`enable-app.sh` contract:**
+
+`enable-app.sh <appname>` is the generator for `applications.yaml` entries. It:
+
+1. Reads `site/config.yaml` for cluster topology (subnets, VMID ranges, existing allocations)
+2. Reads `framework/catalog/<app>/` for defaults (RAM, cores, disk sizes, health endpoints, backup flag)
+3. Allocates VMID, IP, and MAC for each environment without prompting the operator
+4. Appends a complete, self-documenting block to `site/applications.yaml`
+5. Continues to write `site/nix/hosts/<app>.nix` and copy `site/apps/<app>/` config files as before
+6. Prints a summary of what was generated and what the operator should review
+
+The generated block is the operator's primary interface. Every derivable value is filled in with a comment explaining its derivation. Every constraint (valid IP range, VMID scheme) is stated adjacent to the value it constrains, with a grep command for duplicate checking. The operator reviews the block, overrides anything that needs changing, and proceeds. No interactive prompting.
+
+**Inline comment format:**
+
+```yaml
+applications:
+  grafana:
+    # node: node1    # default: least-loaded node at generation time
+    node: node1
+    ram: 1024        # default from catalog; override if needed
+    cores: 2
+    disk_size: 4
+    data_disk_size: 4
+    backup: false    # set true if this app has precious state on vdb
+
+    environments:
+      prod:
+        # IP must be in prod subnet: 10.0.10.50–10.0.10.254
+        # Check for duplicates: grep 'ip:' site/config.yaml site/applications.yaml
+        ip: 10.0.10.65
+        # VMID scheme: 6xx = prod apps; same role offset across dev/prod
+        # Check for duplicates: grep 'vmid:' site/config.yaml site/applications.yaml
+        vmid: 601
+        # MAC is stable across rebuilds — preserves layer 2 identity on rebuild
+        mac: 02:ab:cd:ef:12:34
+      dev:
+        ip: 10.0.20.65
+        vmid: 501
+        mac: 02:ab:cd:ef:56:78
+
+    # App-specific parameters — see framework/catalog/grafana/README.md
+    # health_port: 3000
+    # health_path: /api/health
+```
+
+**Convention-over-configuration:**
+
+Derived values are filled in by the generator; the operator overrides by editing the value directly. Framework defaults are shown as comments where relevant. App-specific optional parameters that cannot be derived (e.g., `mounts`, `mgmt_nic`, `proxmox_metrics`) are emitted as commented-out placeholders pointing to the app's README.
+
+**Dependency note:**
+
+`applications.yaml` depends on topology values defined in `site/config.yaml` (subnets, VMID ranges, node names). If you change subnets or VMID ranges in `config.yaml`, the range comments in `applications.yaml` will be stale and must be updated manually. A note in `config.yaml` near the subnet and VMID scheme definitions reminds the operator of this.
+
+**Config validation:**
+
+`framework/scripts/validate-site-config.sh` is a standalone consistency checker
+for `site/config.yaml` and `site/applications.yaml`. It is called by every
+consumer of these files before triggering any side effects. Consumers include
+`enable-app.sh`, `tofu-wrapper.sh`, and `build-all-images.sh`. If validation
+fails, the consumer prints the errors and exits without proceeding.
+
+This script is distinct from `validate.sh`, which validates a running cluster.
+`validate-site-config.sh` validates the config files themselves — before
+anything is built or deployed.
+
+Checks performed:
+- VMID uniqueness across both files
+- IP uniqueness per environment across both files
+- MAC uniqueness across both files
+- Application VMIDs within correct ranges (5xx dev, 6xx prod)
+- Application IPs within declared subnets
+- Node references exist in `config.yaml → nodes`
+- Both files are valid YAML with required fields present
+
+The script exits 0 silently on success. It exits 1 with all failures reported
+before exiting — it does not stop at the first error.
+
+**Migration:**
+
+Existing application entries in `site/config.yaml` (added by previous versions of `enable-app.sh`) should be moved to `site/applications.yaml` manually by the operator. This is a one-time migration. Move the block, verify the result, remove the old entry from `config.yaml`. Do not run the migration with a script — the operator should see and confirm what moved.
+
 ---
 
 ## 13. Bootstrap Sequence
@@ -3654,9 +3759,9 @@ This script executes the following sequence automatically:
 
    [network]
    source = "from-answer"
-   cidr = "10.0.0.60/24"                  # from config.yaml → vms.pbs.ip + subnet mask
-   dns = "10.0.0.1"                       # management gateway
-   gateway = "10.0.0.1"                   # management gateway
+   cidr = "172.17.77.60/24"               # from config.yaml → vms.pbs.ip + subnet mask
+   dns = "172.17.77.1"                    # management gateway
+   gateway = "172.17.77.1"                # management gateway
 
    [network.filter]
    ID_NET_NAME = "ens*"                   # required — identifies which NIC to configure
@@ -4558,10 +4663,49 @@ Application-specific content checks in 16a and 16b:
 
 | VM | "Has real state" signal | "Empty/fresh" signal |
 |----|------------------------|---------------------|
-| GitLab | Project exists via API | No projects |
+| GitLab | (1) PG base/ >50MB; (2) psql SELECT 1 succeeds; (3) projects COUNT >0 via psql; (4) API count >0 (informational — may be 0 on temp VM due to peer auth) | Fresh PG init (~8MB), psql fails or projects=0 |
 | Vault | Initialized and tokens match SOPS | Uninitialized or token mismatch |
 | InfluxDB | Organization exists via API | No organizations |
-| Roon | `/var/lib/roon-server/Database/` has content | Empty database directory |
+| Roon | `/var/lib/roon-server/RoonServer/` has content | Empty directory |
+
+These checks are used by `rebuild-cluster.sh`'s three-gate model —
+they are semantic, application-level checks against running services.
+
+**Note on GitLab verification layers:** DRT-007 uses a four-layer
+diagnostic approach for GitLab. Layer 1 (filesystem) checks restore
+integrity — did the vdb data survive? Layer 2 (psql connectivity)
+checks whether PostgreSQL can start with the restored data — peer
+authentication blocks the `gitlab` OS user on temp VMs, but the
+`postgres` superuser can connect regardless. Layer 3 (project count
+via psql) checks data integrity — are the GitLab tables populated?
+Layer 4 (HTTP API) is informational only — peer auth prevents Rails
+from connecting to PostgreSQL on temp VMs, so a count of 0 is
+expected and does not indicate a backup problem. A failure at each
+layer points to a different root cause.
+
+**Pipeline restore detection (`restore-after-deploy.sh`):**
+
+The pipeline uses a different, simpler mechanism to determine which
+VMs need restore after a deploy: uptime. If a VM has been running for
+less than 10 minutes, it was just recreated by `safe-apply.sh` and
+needs its vdb restored from PBS. VMs that have been running for hours
+were not recreated and must not be touched.
+
+Filesystem-based markers (checking for the presence of application
+data directories) were considered and rejected. NixOS VMs are
+designed to self-initialize — every service creates its directory
+structure and default data on first boot. By the time
+`restore-after-deploy.sh` runs, a freshly formatted vdb is
+indistinguishable from a restored vdb at the filesystem level.
+InfluxDB creates its engine directory on first boot; GitLab runs
+`initdb`; Roon creates its library directory. There is no reliable
+filesystem signal that survives first-boot initialization.
+
+Uptime detection is application-agnostic and requires no per-app
+configuration. A new precious-state VM added via `enable-app.sh`
+is automatically handled: low uptime on first deploy triggers a
+restore attempt; if no PBS backup exists for the new VMID,
+`restore-from-pbs.sh` skips it cleanly.
 
 **Prod verification drills:**
 
@@ -4672,8 +4816,8 @@ create the worst case:
 
 ```bash
 # Force a replication sync right before reset (creates fresh ZFS holds)
-for job in $(ssh -n root@<node1-ip> "pvesr list" | tail -n +2 | awk '{print $1}'); do
-  ssh -n root@<node1-ip> "pvesr schedule-now $job"
+for job in $(ssh -n root@172.17.77.51 "pvesr list" | tail -n +2 | awk '{print $1}'); do
+  ssh -n root@172.17.77.51 "pvesr schedule-now $job"
 done
 sleep 5
 # NOW run the reset — if it handles this, it handles anything
@@ -4685,6 +4829,29 @@ they don't verify the transition from state A to state B — "was every
 resource in state A actually cleaned up?" Post-condition assertions verify
 the transition. Adversarial pre-conditions ensure the transition is tested
 under worst-case conditions, not just favorable timing.
+
+### 14.7 DR Test Framework
+
+The DR test framework lives in `framework/dr-tests/`. It provides
+structured test scripts that validate recovery behavior under
+destructive conditions — distinct from `validate.sh`, which checks a
+running cluster.
+
+Tests are run via `framework/dr-tests/run-dr-test.sh <DRT-ID>`.
+
+`DR-REGISTRY.md` is the ratchet. It records when each scenario was
+last validated and at what commit. After any significant change, the
+operator scans the Invalidation Quick Reference to determine which
+tests must be re-run. A change is not safe until all tests it
+invalidates show a Last Run commit equal to or after the change commit.
+
+Elapsed time is tracked as a regression signal — a passing test that
+takes 50% longer than baseline is worth investigating even though the
+test passed.
+
+All tests handle their own pre-test safety envelope (backup before
+destruction). The operator never risks precious state by running a
+test.
 
 ---
 
@@ -5387,8 +5554,8 @@ changes), only the changed VMs are recreated and the recovery is scoped to those
 15. At the old domain's registrar: leave the old delegation in place temporarily,
     then remove after cutover is confirmed.
 
-**Validated:** This procedure has been exercised in production domain migrations.
-36/37 validation checks passed; the single failure was a pre-existing gap
+**Validated:** This procedure was exercised during the `wuertele.com` → `bfnet.com`
+migration. 36/37 validation checks passed; the single failure was a pre-existing gap
 unrelated to the domain change.
 
 **Known gap — Gatus snippet content detection:** The bpg Proxmox provider references
@@ -5667,12 +5834,21 @@ failures. It is not blocking any current work.
 | No Git on HAOS VM | Git clone on HAOS VM | Eliminates Git credentials on HAOS, avoids dirty working directory from runtime state, all Git operations happen on Mac with full tooling. |
 | `secrets.yaml` via SOPS | Manual copy, Vault | Brings HAOS secrets into existing SOPS model. HAOS doesn't have vault-agent, so Vault integration is impractical. SOPS decrypt during deploy is simple and auditable. |
 
-### Validation
+### Application Configuration
 
 | Decision | Alternatives Considered | Motivation |
 |----------|------------------------|------------|
-| Multi-trigger validation | Manual only, single trigger | Catch issues early, fast feedback, enforce invariants |
-| Block merge on failure | Warn only | Prevent broken code from reaching production |
+| Application VM specs in `site/applications.yaml`, separate from `site/config.yaml` | Single `config.yaml` for all VM types | Framework VMs and application VMs have different ownership, lifecycle, and editors. Mixing them in one file forces the operator to navigate framework configuration when adding an application. A separate file makes each file's scope self-evident and keeps the application VM specification contiguous. |
+| `enable-app.sh` and `new-site.sh` are helpers, not gatekeepers | Generators as required setup steps | The framework reads files; it does not care how those files were produced. An operator who writes `applications.yaml` by hand without running `enable-app.sh` gets a fully working cluster. Generators exist to save the operator from knowing every field and derivation rule on day one. They are not in the framework's execution path. Making them required would mean a generator bug could block all deployments. |
+| Re-running a generator must never overwrite operator edits | Generator re-runs update or replace generated content | Operator edits in generated files represent intent. A generator that silently overwrites them is a data-loss bug. Generators write to new entries only; existing content is never touched. This is a hard invariant enforced by the idempotency check (exit if entry already exists). |
+| `enable-app.sh` writes complete blocks to `applications.yaml` without interactive prompting | Interactive wizard collecting values one at a time | The file is the interface. An operator who edits the generated block directly sees the full context — constraints, ranges, adjacent values. A wizard presents values one at a time with no context. The generated block is reviewable, auditable, and editable; a wizard's output is opaque until you open the file afterward. |
+| Inline comments at point of action (adjacent to the value they constrain) | Header comment summarizing constraints, separate documentation | An operator editing a specific value reads the comment immediately above that line. They do not scroll back to a file header. Constraints and verification commands belong where the operator's cursor is. |
+| Generator writes comments once; operator maintains them thereafter | Generator refreshes comments on re-run | Re-running a generator over operator-authored content creates a boundary problem: which content does the generator own, which does the operator own? Writing once is simpler and puts the operator fully in control of the file after generation. The staleness risk (subnet changes invalidating range comments) is real but rare and addressed by a reminder note in `config.yaml`. |
+| `validate-site-config.sh` called by all consumers before side effects | Per-consumer validation, or no validation | Config errors (duplicate VMIDs, IPs out of range, missing node references) are best caught once in one place, before any consumer acts on them. Per-consumer validation duplicates logic and risks inconsistency. Calling a shared validator as the first step of every consumer is the correct pattern: the caller fails fast with a clear error, and the validation logic has one place to improve. |
+
+
+### Validation
+
 
 ### Monitoring
 

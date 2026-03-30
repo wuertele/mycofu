@@ -232,9 +232,10 @@ else
 
   RUNNER_TOKEN=$(echo "$RUNNER_RESPONSE" | jq -r '.token // empty')
   if [[ -z "$RUNNER_TOKEN" ]]; then
-    echo "  WARNING: Could not create runner via API. Response:"
-    echo "$RUNNER_RESPONSE" | jq .
-    echo "  You may need to create the runner manually in the GitLab UI."
+    echo "  ERROR: Could not create runner token via API. Response:" >&2
+    echo "$RUNNER_RESPONSE" | jq . >&2
+    echo "  register-runner.sh will fail without this token." >&2
+    exit 1
   else
     echo "  Runner token obtained"
     echo "  Storing in SOPS..."
@@ -314,7 +315,8 @@ if [[ -n "$CURRENT_BRANCH" ]]; then
   if git -C "$REPO_DIR" push gitlab "$CURRENT_BRANCH" --force 2>&1; then
     echo "  Push successful"
   else
-    echo "  WARNING: Push failed — check SSH key registration and GitLab SSH config"
+    echo "  ERROR: Push failed — check SSH key registration and GitLab SSH config" >&2
+    exit 1
   fi
 else
   echo "  WARNING: Not on a branch — skipping push"
@@ -343,7 +345,8 @@ for BRANCH in dev prod; do
     if [[ "$RESULT" == "$BRANCH" ]]; then
       echo "  Created branch '${BRANCH}' from '${REF}'"
     else
-      echo "  WARNING: Could not create branch '${BRANCH}'"
+      echo "  ERROR: Could not create branch '${BRANCH}'" >&2
+      exit 1
     fi
   fi
 done
@@ -360,6 +363,80 @@ else
     "${GITLAB_URL}/api/v4/projects/${PROJECT_ID}/protected_branches" \
     --data "name=prod&push_access_level=0&merge_access_level=40" 2>/dev/null | jq -r '.name // empty' > /dev/null
   echo "  Branch 'prod' protected (push=no one, merge=maintainers)"
+fi
+
+# Step 6c2: Require pipeline success for merging
+# Without this, the guard:control-plane CI job can fail but the MR
+# can still be merged — defeating the purpose of the guard.
+echo ""
+echo "=== Step 6c2: Require pipeline success for merging ==="
+curl -sk -X PUT -H "$AUTH_HEADER" \
+  "${GITLAB_URL}/api/v4/projects/${PROJECT_ID}" \
+  --data "only_allow_merge_if_pipeline_succeeds=true" 2>/dev/null | jq -r '.only_allow_merge_if_pipeline_succeeds' > /dev/null
+echo "  Merge requires passing pipeline"
+
+# Step 6d: Create issue labels from site/gitlab.yaml
+echo ""
+echo "=== Step 6d: Create labels ==="
+GITLAB_YAML="${REPO_DIR}/site/gitlab.yaml"
+if [[ -f "$GITLAB_YAML" ]]; then
+  LABEL_COUNT=$(yq '.labels | length' "$GITLAB_YAML" 2>/dev/null || echo 0)
+  if [[ "$LABEL_COUNT" -gt 0 ]]; then
+    for i in $(seq 0 $((LABEL_COUNT - 1))); do
+      LABEL_NAME=$(yq ".labels[$i].name" "$GITLAB_YAML")
+      LABEL_COLOR=$(yq ".labels[$i].color" "$GITLAB_YAML")
+      LABEL_DESC=$(yq ".labels[$i].description" "$GITLAB_YAML")
+      result=$(curl -sk -w "%{http_code}" -o /dev/null -X POST \
+        "${GITLAB_URL}/api/v4/projects/${PROJECT_ID}/labels" \
+        -H "$AUTH_HEADER" \
+        --data-urlencode "name=${LABEL_NAME}" \
+        --data-urlencode "color=${LABEL_COLOR}" \
+        --data-urlencode "description=${LABEL_DESC}" 2>/dev/null)
+      if [[ "$result" == "201" ]]; then
+        echo "  Created: ${LABEL_NAME}"
+      elif [[ "$result" == "409" ]]; then
+        echo "  Exists:  ${LABEL_NAME}"
+      else
+        echo "  Warning: ${LABEL_NAME} (HTTP ${result})"
+      fi
+    done
+    echo "  ${LABEL_COUNT} labels processed"
+  else
+    echo "  No labels defined in ${GITLAB_YAML}"
+  fi
+else
+  echo "  No site/gitlab.yaml — skipping label creation"
+fi
+
+# Step 6e: Create milestones from site/gitlab.yaml
+echo ""
+echo "=== Step 6e: Create milestones ==="
+if [[ -f "$GITLAB_YAML" ]]; then
+  MILESTONE_COUNT=$(yq '.milestones | length' "$GITLAB_YAML" 2>/dev/null || echo 0)
+  if [[ "$MILESTONE_COUNT" -gt 0 ]]; then
+    for i in $(seq 0 $((MILESTONE_COUNT - 1))); do
+      MS_TITLE=$(yq ".milestones[$i].title" "$GITLAB_YAML")
+      MS_DESC=$(yq ".milestones[$i].description" "$GITLAB_YAML")
+      response=$(curl -sk -w "\n%{http_code}" -X POST \
+        "${GITLAB_URL}/api/v4/projects/${PROJECT_ID}/milestones" \
+        -H "$AUTH_HEADER" \
+        --data-urlencode "title=${MS_TITLE}" \
+        --data-urlencode "description=${MS_DESC}" 2>/dev/null)
+      http_code=$(echo "$response" | tail -1)
+      if [[ "$http_code" == "201" ]]; then
+        echo "  Created: ${MS_TITLE}"
+      elif [[ "$http_code" == "400" ]] && echo "$response" | grep -q "already"; then
+        echo "  Exists:  ${MS_TITLE}"
+      else
+        echo "  Warning: ${MS_TITLE} (HTTP ${http_code})"
+      fi
+    done
+    echo "  ${MILESTONE_COUNT} milestones processed"
+  else
+    echo "  No milestones defined in ${GITLAB_YAML}"
+  fi
+else
+  echo "  No site/gitlab.yaml — skipping milestone creation"
 fi
 
 # Step 7: Disable telemetry and outbound data collection

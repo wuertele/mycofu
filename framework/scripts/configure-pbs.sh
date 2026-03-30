@@ -359,9 +359,18 @@ if pbs_ssh_key "proxmox-backup-manager datastore list --output-format json" \
     echo "  Datastore '${DATASTORE_NAME}' already exists — verified functional"
   else
     echo "  Datastore '${DATASTORE_NAME}' is configured but .chunks is missing — recreating..."
+    # Check if the mount point has backup data that would be destroyed
+    BACKUP_FILES=$(pbs_ssh_key "find ${DATASTORE_MOUNT} -name '*.fidx' -o -name '*.didx' 2>/dev/null | wc -l" 2>/dev/null || echo "0")
+    if [[ "$BACKUP_FILES" -gt 0 ]]; then
+      echo "  ERROR: ${DATASTORE_MOUNT} contains ${BACKUP_FILES} backup files but .chunks is missing." >&2
+      echo "  This may indicate a corrupted datastore. Refusing to delete backup data." >&2
+      echo "  To force recreation, manually remove the contents:" >&2
+      echo "    ssh root@<pbs-ip> 'rm -rf ${DATASTORE_MOUNT}/.chunks ${DATASTORE_MOUNT}/vm ${DATASTORE_MOUNT}/ct'" >&2
+      exit 1
+    fi
     pbs_ssh_key "proxmox-backup-manager datastore remove ${DATASTORE_NAME}" 2>/dev/null || true
     sleep 2
-    # Clean the mount point (Synology leaves #recycle and @eaDir)
+    # Clean the mount point (Synology leaves #recycle and @eaDir — no backup data at this point)
     pbs_ssh_key "find ${DATASTORE_MOUNT} -mindepth 1 -delete 2>/dev/null || true"
     pbs_ssh_key "proxmox-backup-manager datastore create ${DATASTORE_NAME} ${DATASTORE_MOUNT}" 2>&1
     if pbs_ssh_key "test -d ${DATASTORE_MOUNT}/.chunks" 2>/dev/null; then
@@ -447,9 +456,10 @@ if [[ "$TOKEN_EXISTS" == "false" ]]; then
     sops --set "[\"pbs_api_token\"] \"${TOKEN_SECRET}\"" "$SECRETS_FILE"
     echo "  Token stored in SOPS"
   else
-    echo "WARNING: Could not extract token secret from output:" >&2
+    echo "ERROR: Could not extract token secret from output:" >&2
     echo "$TOKEN_OUTPUT" >&2
-    echo "You may need to manually add pbs_api_token to SOPS." >&2
+    echo "Cannot configure Proxmox storage or backup jobs without the token." >&2
+    exit 1
   fi
 fi
 
@@ -512,7 +522,7 @@ if pve_ssh "pvesh get /storage/pbs-nas --output-format json" &>/dev/null; then
       && echo "  Storage entry recreated with current fingerprint and token" \
       || {
         # Fallback to direct storage.cfg write
-        pve_ssh "cat >> /etc/pve/storage.cfg << 'STOREOF'
+        pve_ssh "cat >> /etc/pve/storage.cfg << STOREOF
 
 pbs: pbs-nas
 	datastore ${DATASTORE_NAME}
@@ -530,10 +540,11 @@ chmod 600 /etc/pve/priv/storage/pbs-nas.pw"
   fi
 else
   if [[ -z "$PBS_API_TOKEN" ]]; then
-    echo "  WARNING: No API token in SOPS — cannot configure Proxmox storage" >&2
-    echo "  Run this script again after adding pbs_api_token to SOPS" >&2
+    echo "  ERROR: No API token in SOPS — cannot configure Proxmox storage" >&2
+    exit 1
   elif [[ -z "$PBS_FINGERPRINT" ]]; then
-    echo "  WARNING: No fingerprint — cannot configure Proxmox storage" >&2
+    echo "  ERROR: No fingerprint — cannot configure Proxmox storage" >&2
+    exit 1
   else
     echo "  Adding PBS storage to Proxmox..."
     if pve_ssh "pvesh create /storage \
@@ -548,7 +559,7 @@ else
       echo "  PBS storage added via pvesh"
     else
       echo "  pvesh failed (validation issue) — writing storage.cfg directly..."
-      pve_ssh "cat >> /etc/pve/storage.cfg << 'EOF'
+      pve_ssh "cat >> /etc/pve/storage.cfg << EOF
 
 pbs: pbs-nas
 	datastore ${DATASTORE_NAME}
@@ -608,7 +619,8 @@ for vm_name in vault-prod vault-dev gitlab; do
 done
 
 if [[ -z "$BACKUP_VMIDS" ]]; then
-  echo "  WARNING: No VMIDs found — cannot create backup job"
+  echo "  ERROR: No VMIDs found — cannot create backup jobs for precious-state VMs" >&2
+  exit 1
 else
   # Check if a backup job already exists for pbs-nas
   EXISTING_JOB=$(pve_ssh "pvesh get /cluster/backup --output-format json" 2>/dev/null \

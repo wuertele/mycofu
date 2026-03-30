@@ -271,6 +271,10 @@ echo ""
 # scans ALL nodes for zvols belonging to VMIDs that don't match any running VM.
 echo "==> Checking for globally orphaned zvols (destroyed VMIDs)..."
 ALL_VMIDS=$(echo "$VM_DATA" | jq -r '.[].vmid' | sort -u)
+if [[ -z "$ALL_VMIDS" ]]; then
+  echo "  WARNING: Could not enumerate VMs from cluster API — skipping global orphan cleanup"
+  echo "  (This prevents accidental destruction of all zvols when the API is temporarily unreachable)"
+else
 GLOBAL_ORPHANS=0
 
 for NODE_NAME_ITER in $NODE_NAMES; do
@@ -304,6 +308,7 @@ for NODE_NAME_ITER in $NODE_NAMES; do
   done
 done
 echo "  Cleaned ${GLOBAL_ORPHANS} globally orphaned VMID sets"
+fi  # end ALL_VMIDS guard
 echo ""
 
 # --- Create/verify replication jobs ---

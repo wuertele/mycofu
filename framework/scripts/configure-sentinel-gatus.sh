@@ -132,8 +132,18 @@ ssh -n "${NAS_USER}@${NAS_IP}" "mkdir -p /volume1/docker/placement-watchdog"
 scp -O -q "${REPO_DIR}/framework/scripts/placement-watchdog.sh" "${NAS_USER}@${NAS_IP}:/volume1/docker/placement-watchdog/"
 scp -O -q "${REPO_DIR}/framework/scripts/rebalance-cluster.sh" "${NAS_USER}@${NAS_IP}:/volume1/docker/placement-watchdog/"
 
-# Convert config.yaml to JSON for the NAS (NAS has jq but not yq)
-yq -o json "${REPO_DIR}/site/config.yaml" | ssh "${NAS_USER}@${NAS_IP}" "cat > /volume1/docker/placement-watchdog/config.json"
+# Convert config.yaml + applications.yaml to merged JSON for the NAS (NAS has jq but not yq).
+# The NAS scripts use cfg_query() which reads from this merged JSON.
+# Applications live in a separate file but the NAS scripts expect a single combined view.
+APPS_YAML="${REPO_DIR}/site/applications.yaml"
+CONFIG_JSON=$(yq -o json "${REPO_DIR}/site/config.yaml")
+if [[ -f "$APPS_YAML" ]]; then
+  APPS_JSON=$(yq -o json '.applications // {}' "$APPS_YAML")
+else
+  APPS_JSON='{}'
+fi
+echo "$CONFIG_JSON" "$APPS_JSON" | jq -s '(.[0] | del(.applications)) + {applications: .[1]}' | \
+  ssh "${NAS_USER}@${NAS_IP}" "cat > /volume1/docker/placement-watchdog/config.json"
 
 # Make scripts executable on NAS
 ssh -n "${NAS_USER}@${NAS_IP}" "chmod +x /volume1/docker/placement-watchdog/*.sh"
