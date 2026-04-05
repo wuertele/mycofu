@@ -82,12 +82,12 @@ variable "storage_pool" {
 }
 
 variable "acme_server_url" {
-  description = "ACME directory URL (Pebble in dev, Let's Encrypt in prod)"
+  description = "ACME directory URL (step-ca in dev, Let's Encrypt in prod)"
   type        = string
 }
 
-variable "acme_ca_cert" {
-  description = "PEM content of the ACME server's CA cert (empty = use system CA bundle)"
+variable "extra_ca_cert" {
+  description = "PEM content of the extra CA root delivered via CIDATA (empty = no extra CA)"
   type        = string
   default     = ""
 }
@@ -110,6 +110,34 @@ variable "zone_data" {
 variable "domain" {
   description = "Base domain (written to CIDATA to trigger recreation on domain change)"
   type        = string
+  default     = ""
+}
+
+variable "dns1_vault_approle_role_id" {
+  description = "Vault AppRole role_id for dns1"
+  type        = string
+  sensitive   = true
+  default     = ""
+}
+
+variable "dns1_vault_approle_secret_id" {
+  description = "Vault AppRole secret_id for dns1"
+  type        = string
+  sensitive   = true
+  default     = ""
+}
+
+variable "dns2_vault_approle_role_id" {
+  description = "Vault AppRole role_id for dns2"
+  type        = string
+  sensitive   = true
+  default     = ""
+}
+
+variable "dns2_vault_approle_secret_id" {
+  description = "Vault AppRole secret_id for dns2"
+  type        = string
+  sensitive   = true
   default     = ""
 }
 

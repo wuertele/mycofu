@@ -50,6 +50,7 @@ in
   # written by configure-static-network and writes resolv.conf.
 
   # --- vdb mount at /var/lib/gitlab ---
+  mycofu.vdbMountPoint = "/var/lib/gitlab";
   fileSystems."/var/lib/gitlab" = {
     device = "/dev/disk/by-label/gitlab-data";
     fsType = "ext4";

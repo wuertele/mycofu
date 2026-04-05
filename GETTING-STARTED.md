@@ -495,6 +495,14 @@ One command. No interaction. This runs the full bootstrap sequence:
 and re-run. The script is idempotent — it detects completed steps and skips
 them.
 
+**Branch check on initial deploy:** `rebuild-cluster.sh` normally requires the
+`prod` branch for any prod-affecting scope. For an initial cluster deployment,
+it automatically detects that no existing deployment is present (empty tofu
+state and no configured VMs in Proxmox) and skips the branch check with an
+informational message. You can be on any branch for the initial deploy — no
+`--override-branch-check` flag is needed. After the cluster is up and GitLab
+is running, subsequent workstation rebuilds must be run from the `prod` branch.
+
 **Expected duration:** ~30 minutes. First-time builds are slower because
 the Nix store must download the full NixOS closure (~6 GB for the GitLab
 image alone). Subsequent rebuilds reuse the Nix cache and complete faster.
@@ -596,6 +604,21 @@ Your cluster is operational. From here:
   explaining what the config values mean and what to set them to.
 - **Push changes via the pipeline** — `git push gitlab dev` deploys to dev;
   merge to `prod` deploys to prod
+- **Enable Tailscale remote access** — if any VMs have `tailscale: true`
+  in `site/config.yaml` or `site/applications.yaml`, complete the Tailscale
+  setup steps in your `site/bringup.md` before deploying:
+
+  1. Define tag owners in the Tailscale admin console ACL policy
+     (the complete JSON is in your bringup.md)
+  2. Generate a reusable auth key at https://login.tailscale.com/admin/settings/keys
+  3. Store it in Vault: `vault kv put secret/tailscale auth_key="tskey-auth-..."`
+
+  After deploying, Tailscale-enabled VMs join your tailnet automatically
+  once vault-agent delivers the auth key. Node identities are stored in
+  Vault and survive rebuilds — the VM keeps the same Tailscale identity
+  across redeployments. See OPERATIONS.md "Tailscale Identity Lost or
+  Mismatched" for troubleshooting.
+
 - **Review the operational cadence** — [OPERATIONS.md](OPERATIONS.md) covers
   maintenance schedules, troubleshooting, and break-glass procedures
 - **Understand the architecture** — [architecture.md](architecture.md)

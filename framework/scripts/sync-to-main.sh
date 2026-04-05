@@ -32,7 +32,7 @@ echo "Checking out main..."
 git checkout main
 
 echo "Applying framework changes from dev..."
-DIFF=$(git diff main..dev -- framework/ docs/ README.md architecture.md GETTING-STARTED.md OPERATIONS.md .gitlab-ci.yml flake.nix flake.lock CLAUDE.md)
+DIFF=$(git diff main..dev -- framework/ tests/ docs/ ':!docs/prompts/' ':!docs/reports/' ':!docs/sprints/' README.md architecture.md GETTING-STARTED.md OPERATIONS.md .gitlab-ci.yml flake.nix flake.lock CLAUDE.md)
 if [[ -n "$DIFF" ]]; then
   echo "$DIFF" | git apply
 else
@@ -42,7 +42,10 @@ else
 fi
 
 echo "Staging and committing..."
-git add framework/ docs/ README.md architecture.md GETTING-STARTED.md OPERATIONS.md .gitlab-ci.yml flake.nix flake.lock CLAUDE.md 2>/dev/null || true
+git add framework/ tests/ README.md architecture.md GETTING-STARTED.md OPERATIONS.md .gitlab-ci.yml flake.nix flake.lock CLAUDE.md 2>/dev/null || true
+# Sync docs/ but exclude site-specific subdirectories (prompts, reports, sprints)
+git add docs/ 2>/dev/null || true
+git reset HEAD -- docs/prompts/ docs/reports/ docs/sprints/ 2>/dev/null || true
 if git diff --cached --quiet; then
   echo "No changes to commit."
   git checkout dev

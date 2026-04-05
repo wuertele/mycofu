@@ -30,11 +30,19 @@ CONFIG_FILE="${REPO_DIR}/site/config.yaml"
 SECRETS_FILE="${REPO_DIR}/site/sops/secrets.yaml"
 
 # --- Parse arguments ---
-if [[ $# -ne 1 ]] || [[ "$1" != "prod" && "$1" != "dev" ]]; then
-  echo "Usage: $0 <prod|dev>" >&2
+FORCE_INIT=false
+ENV=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --force-init) FORCE_INIT=true; shift ;;
+    prod|dev) ENV="$1"; shift ;;
+    *) echo "Usage: $0 [--force-init] <prod|dev>" >&2; exit 1 ;;
+  esac
+done
+if [[ -z "$ENV" ]]; then
+  echo "Usage: $0 [--force-init] <prod|dev>" >&2
   exit 1
 fi
-ENV="$1"
 
 # --- Check prerequisites ---
 for tool in sops yq jq curl; do
@@ -124,37 +132,20 @@ if [[ "$INITIALIZED" == "true" ]]; then
     if [[ "$VERIFY" == "200" ]]; then
       echo "SOPS root token verified."
     else
-      echo "WARNING: SOPS root token is invalid (HTTP ${VERIFY})."
-      echo "The SOPS root token does not match Vault's token store."
-      echo "This is expected after PBS restores stale Raft data (e.g., domain change)."
-      echo ""
-      echo "Auto-recovering: wiping Raft data (preserving TLS certs) and reinitializing..."
-      # Wipe ONLY Raft data — NOT /var/lib/vault/* which would also
-      # destroy TLS certs at /var/lib/vault/tls/ and cause crash-loops.
-      ssh -n -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-        "root@${VAULT_IP}" "rm -rf /var/lib/vault/data/*" 2>/dev/null
-      # Also remove stale unseal key and root token from vdb
-      ssh -n -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-        "root@${VAULT_IP}" "rm -f /var/lib/vault/unseal-key /var/lib/vault/root-token" 2>/dev/null
-      ssh -n -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-        "root@${VAULT_IP}" "systemctl restart vault" 2>/dev/null
-      echo "Vault restarted. Waiting for it to come up..."
-      sleep 10
-
-      # Verify Vault is now uninitialized
-      HEALTH2=$(vault_api GET sys/health || echo '{}')
-      INIT2=$(echo "$HEALTH2" | jq -r '.initialized // "unknown"')
-      if [[ "$INIT2" != "false" ]]; then
-        echo "ERROR: Vault did not become uninitialized after Raft wipe (initialized=$INIT2)." >&2
-        echo "Manual recovery:" >&2
-        echo "  ssh root@${VAULT_IP} 'rm -rf /var/lib/vault/data/*'" >&2
-        echo "  ssh root@${VAULT_IP} 'systemctl restart vault'" >&2
-        echo "  Then re-run: $0 ${ENV}" >&2
-        exit 1
-      fi
-      echo "Vault is uninitialized — proceeding with fresh initialization."
-      # Fall through to the initialization code below (don't exit 0)
-      INITIALIZED="false"
+      echo "ERROR: SOPS root token is invalid (HTTP ${VERIFY})." >&2
+      echo "" >&2
+      echo "The SOPS root token does not match Vault's Raft data." >&2
+      echo "This means SOPS and the running Vault were produced by different" >&2
+      echo "vault operator init events. Possible causes:" >&2
+      echo "  - Vault vdb was not restored from PBS after a rebuild" >&2
+      echo "  - SOPS was overwritten by a stale init (write-once violation)" >&2
+      echo "" >&2
+      echo "Recovery options:" >&2
+      echo "  1. Restore Vault vdb from PBS backup (SOPS keys will match):" >&2
+      echo "     framework/scripts/restore-from-pbs.sh --target \$(yq '.vms.vault_${ENV}.vmid' site/config.yaml) --force" >&2
+      echo "  2. If no backup exists, reinitialize (destroys all Vault data):" >&2
+      echo "     $0 --force-init ${ENV}" >&2
+      exit 1
     fi
   else
     echo "ERROR: No root token found in SOPS for ${ENV}." >&2
@@ -162,13 +153,34 @@ if [[ "$INITIALIZED" == "true" ]]; then
     exit 1
   fi
 
-  if [[ "$INITIALIZED" == "true" ]]; then
-    echo ""
-    echo "=== Vault ${ENV} is ready ==="
-    echo "Next step: framework/scripts/configure-vault.sh ${ENV}"
-    exit 0
+  echo ""
+  echo "=== Vault ${ENV} is ready ==="
+  echo "Next step: framework/scripts/configure-vault.sh ${ENV}"
+  exit 0
+fi
+
+# --- Check for existing SOPS keys before initializing ---
+# Write-once safety: if SOPS already has vault keys for this environment,
+# a fresh init will overwrite them — breaking correspondence with PBS backups.
+if [[ -n "$EXISTING_KEY" ]]; then
+  if [[ "$FORCE_INIT" == "true" ]]; then
+    echo "WARNING: SOPS already contains vault keys for ${ENV}."
+    echo "  --force-init specified — proceeding with fresh initialization."
+    echo "  The new keys will NOT match any existing PBS backups."
+  else
+    echo "ERROR: SOPS already contains vault keys for ${ENV}." >&2
+    echo "" >&2
+    echo "Vault is not initialized, but SOPS has keys from a previous init." >&2
+    echo "This usually means Vault's vdb needs to be restored from PBS backup." >&2
+    echo "" >&2
+    echo "Recovery options:" >&2
+    echo "  1. Restore Vault vdb from PBS backup (recommended):" >&2
+    echo "     framework/scripts/restore-from-pbs.sh --target \$(yq '.vms.vault_${ENV}.vmid' site/config.yaml) --force" >&2
+    echo "     Then re-run: $0 ${ENV}" >&2
+    echo "  2. If no backup exists, reinitialize (generates new keys, overwrites SOPS):" >&2
+    echo "     $0 --force-init ${ENV}" >&2
+    exit 1
   fi
-  # INITIALIZED was set to "false" by auto-recovery — fall through
 fi
 
 # --- Initialize Vault ---

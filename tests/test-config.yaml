@@ -1,0 +1,157 @@
+# Test configuration with fake but realistic values
+# Uses RFC 5737 (203.0.113.0/24) for public IPs and example.com for domain
+
+domain: example.com
+registrar: ionos
+
+environments:
+  prod:
+    vlan_id: 10
+    subnet: 10.0.10.0/24
+    gateway: 10.0.10.1
+  dev:
+    vlan_id: 20
+    subnet: 10.0.20.0/24
+    gateway: 10.0.20.1
+
+management:
+  vlan_id: 1
+  subnet: 192.168.1.0/24
+  gateway: 192.168.1.1
+
+nodes:
+  - name: pve01
+    mgmt_ip: 192.168.1.51
+    ram_gb: 32
+    mgmt_iface: eno1
+    repl_ip: 10.10.0.1
+    repl_peers:
+      pve02:
+        iface: enp2s0
+        local_ip: 10.10.12.1/30
+        peer_ip: 10.10.12.2
+      pve03:
+        iface: enp3s0
+        local_ip: 10.10.13.1/30
+        peer_ip: 10.10.13.2
+  - name: pve02
+    mgmt_ip: 192.168.1.52
+    ram_gb: 32
+    mgmt_iface: eno1
+    repl_ip: 10.10.0.2
+    repl_peers:
+      pve01:
+        iface: enp2s0
+        local_ip: 10.10.12.2/30
+        peer_ip: 10.10.12.1
+      pve03:
+        iface: enp3s0
+        local_ip: 10.10.23.1/30
+        peer_ip: 10.10.23.2
+  - name: pve03
+    mgmt_ip: 192.168.1.53
+    ram_gb: 16
+    mgmt_iface: eno1
+    repl_ip: 10.10.0.3
+    repl_peers:
+      pve01:
+        iface: enp2s0
+        local_ip: 10.10.13.2/30
+        peer_ip: 10.10.13.1
+      pve02:
+        iface: enp3s0
+        local_ip: 10.10.23.2/30
+        peer_ip: 10.10.23.1
+
+replication:
+  topology: mesh
+  corosync_subnet: 10.10.0.0/24
+  mtu: 9000
+  health_port: 9100
+
+nas:
+  hostname: nas
+  ip: 192.168.1.200
+  ssh_user: root
+  nfs_export: /volume1/pbs-datastore
+  postgres_port: 5432
+
+proxmox:
+  image_storage_path: /var/lib/vz/template/qcow
+  storage_pool: local-zfs
+
+vms:
+  dns1_prod:
+    ip: 10.0.10.50
+    mac: "02:aa:bb:cc:dd:01"
+  dns2_prod:
+    ip: 10.0.10.51
+    mac: "02:aa:bb:cc:dd:02"
+  vault_prod:
+    ip: 10.0.10.52
+    mac: "02:aa:bb:cc:dd:03"
+  dns1_dev:
+    ip: 10.0.20.50
+    mac: "02:aa:bb:cc:dd:04"
+  dns2_dev:
+    ip: 10.0.20.51
+    mac: "02:aa:bb:cc:dd:05"
+  vault_dev:
+    ip: 10.0.20.52
+    mac: "02:aa:bb:cc:dd:06"
+  pebble:
+    ip: 10.0.20.53
+    mac: "02:aa:bb:cc:dd:07"
+  pbs:
+    ip: 10.0.10.60
+    mac: "02:aa:bb:cc:dd:08"
+  cicd:
+    ip: 10.0.10.61
+    mac: "02:aa:bb:cc:dd:09"
+  gatus:
+    ip: 10.0.10.62
+    mac: "02:aa:bb:cc:dd:0a"
+
+public_ip: 203.0.113.1
+
+email:
+  smtp_host: smtp.example.com
+  smtp_port: 587
+  to: operator@example.com
+
+cicd:
+  system: gitlab
+  runner_tags: ["infra"]
+
+operator_ssh_pubkey: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAItest operator@workstation"
+
+platforms:
+  gateway:
+    type: unifi
+    url: https://192.168.1.1
+    model: UDM-Pro
+  switch:
+    type: unifi
+  nas:
+    type: synology
+    url: https://192.168.1.200:5001
+    model: DS920+
+  registrar:
+    type: ionos
+    url: https://my.ionos.com
+  proxmox:
+    url: https://192.168.1.51:8006
+
+storage:
+  pool_name: local-zfs
+
+cluster:
+  name: AUTO
+
+nix_builder:
+  type: linux-builder
+
+hardware:
+  node_count: 3
+  total_ram_gb: 80
+  n_plus_1_budget_gb: 48

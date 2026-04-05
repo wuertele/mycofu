@@ -29,7 +29,7 @@
             type == "directory" ||
             nixpkgs.lib.hasPrefix "framework/nix/" relPath ||
             nixpkgs.lib.hasPrefix "framework/catalog/" relPath ||
-            nixpkgs.lib.hasPrefix "framework/pebble/" relPath ||
+            nixpkgs.lib.hasPrefix "framework/step-ca/" relPath ||
             nixpkgs.lib.hasPrefix "framework/scripts/certbot-" relPath ||
             nixpkgs.lib.hasPrefix "site/nix/" relPath ||
             nixpkgs.lib.hasPrefix "site/apps/" relPath ||
@@ -54,14 +54,21 @@
         extraSpecialArgs = {
           vaultPackage = pkgsUnstable.vault;
         };
+        # Overlay: pull opentofu from nixpkgs-unstable while keeping everything
+        # else from nixos-24.11. Required for -exclude flag support in
+        # safe-apply.sh (OpenTofu >= 1.9). The nixos-24.11 channel has 1.8.7.
+        opentofuOverlay = { nixpkgs.overlays = [
+          (final: prev: { opentofu = pkgsUnstable.opentofu; })
+        ]; };
         mkImage = modules: import "${nixSrc}/framework/nix/lib/make-image.nix" {
-          inherit nixpkgs system modules extraSpecialArgs;
+          inherit nixpkgs system extraSpecialArgs;
+          modules = [ opentofuOverlay ] ++ modules; # nixSrc: overlay is a pure value, not a file path
         };
         system = imageSystem;
       in {
         base-image    = mkImage [ "${nixSrc}/framework/nix/modules/base.nix" ];
         dns-image     = mkImage [ "${nixSrc}/site/nix/hosts/dns.nix" ];
-        pebble-image  = mkImage [ "${nixSrc}/site/nix/hosts/pebble.nix" ];
+        acme-dev-image = mkImage [ "${nixSrc}/site/nix/hosts/acme-dev.nix" ];
         vault-image   = mkImage [ "${nixSrc}/site/nix/hosts/vault.nix" ];
         gitlab-image  = mkImage [ "${nixSrc}/site/nix/hosts/gitlab.nix" ];
         cicd-image    = mkImage [ "${nixSrc}/site/nix/hosts/cicd.nix" ];

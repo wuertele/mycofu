@@ -1,17 +1,19 @@
 # vault-agent.nix — Reusable Vault agent module for secret retrieval.
 #
 # Any VM that imports this module gets a vault-agent service that:
-#   - Authenticates to Vault using the VM's TLS certificate (cert auth)
+#   - Authenticates to Vault using AppRole (role_id + secret_id from CIDATA)
 #   - Renders secret templates to /run/secrets/vault-agent/
-#   - Watches cert files for changes and re-authenticates
-#   - Manages its own token lifecycle
+#   - Manages its own token lifecycle (auto-renew)
+#
+# AppRole credentials are bootstrap-tier secrets delivered via CIDATA:
+#   /run/secrets/vault/role-id   — stable, write-once
+#   /run/secrets/vault/secret-id — stable, write-once
 #
 # Consuming modules (like dns.nix) declare templates via the
 # vaultAgent.templates option.
 #
-# CA trust: if /run/secrets/certbot/acme-ca-cert exists (dev/Pebble),
-# vault-agent uses it. Otherwise falls back to system CA bundle.
-# This keeps the image environment-ignorant.
+# CA trust uses the system bundle path unconditionally. On dev, the
+# extra-ca-bundle boot service augments that path with the step-ca root.
 
 { config, pkgs, lib, vaultPackage ? pkgs.vault, ... }:
 
@@ -23,36 +25,27 @@ let
     set -euo pipefail
     export PATH=${lib.makeBinPath [ pkgs.gawk pkgs.coreutils pkgs.inetutils ]}:$PATH
 
-    HOSTNAME=$(hostname)
-    SEARCH_DOMAIN=$(awk '/^search / { print $2; exit }' /etc/resolv.conf)
+    SEARCH_DOMAIN=$(cat /run/secrets/network/search-domain 2>/dev/null || true)
     if [ -z "$SEARCH_DOMAIN" ]; then
-      SEARCH_DOMAIN=$(awk -F= '/^DOMAINNAME=/ { print $2; exit }' /run/systemd/netif/leases/* 2>/dev/null || true)
+      SEARCH_DOMAIN=$(awk '/^search / { print $2; exit }' /etc/resolv.conf)
     fi
     if [ -z "$SEARCH_DOMAIN" ]; then
       echo "ERROR: No search domain found for vault-agent" >&2
       exit 1
     fi
-    FQDN="''${HOSTNAME}.''${SEARCH_DOMAIN}"
 
     mkdir -p /run/vault-agent /run/secrets/vault-agent
-
-    # CA cert: use Pebble CA if present, otherwise system bundle
-    CA_CERT_LINE=""
-    if [ -f /run/secrets/certbot/acme-ca-cert ]; then
-      CA_CERT_LINE="ca_cert = \"/run/secrets/certbot/acme-ca-cert\""
-    fi
 
     cat > /run/vault-agent/agent.hcl <<AGENTEOF
     vault {
       address = "https://vault.''${SEARCH_DOMAIN}:8200"
-      $CA_CERT_LINE
     }
 
     auto_auth {
-      method "cert" {
+      method "approle" {
         config = {
-          client_cert = "/etc/letsencrypt/live/''${FQDN}/cert.pem"
-          client_key  = "/etc/letsencrypt/live/''${FQDN}/privkey.pem"
+          role_id_file_path   = "/run/secrets/vault/role-id"
+          secret_id_file_path = "/run/secrets/vault/secret-id"
         }
       }
 
@@ -67,7 +60,7 @@ let
     ${cfg.extraConfig}
     AGENTEOF
 
-    echo "vault-agent config written for ''${FQDN} → vault.''${SEARCH_DOMAIN}:8200"
+    echo "vault-agent config written: vault.''${SEARCH_DOMAIN}:8200 (AppRole auth)"
   '';
 in
 {
@@ -90,16 +83,18 @@ in
       description = "Vault Agent — secret retrieval";
       wantedBy = [ "multi-user.target" ];
       after = [
+        "extra-ca-bundle.service"
         "network-online.target"
-        "certbot-initial.service"
+        "nocloud-init.service"
         "write-resolv-conf.service"
       ];
-      wants = [ "network-online.target" ];
-      requires = [ "certbot-initial.service" ];
+      wants = [ "extra-ca-bundle.service" "network-online.target" ];
+      requires = [ "nocloud-init.service" ];
       # vault binary requires getent at runtime for token helper path
       # expansion. Without it: "exec: getent: executable file not found
       # in $PATH" and vault-agent crash-loops indefinitely.
-      path = [ pkgs.glibc.bin ];
+      # getent is in pkgs.glibc.getent (split from pkgs.glibc.bin in newer nixpkgs).
+      path = [ pkgs.glibc.getent ];
       serviceConfig = {
         Type = "simple";
         ExecStartPre = "+${agentConfigScript}";

@@ -96,6 +96,16 @@ validate:nix-checks:
     - if: $CI_COMMIT_BRANCH == "dev"
     - if: $CI_COMMIT_BRANCH == "prod"
 
+validate:rebuild-branch-guard:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_rebuild_branch_guard.sh
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "prod"
+
 # Guard: block prod MRs if control-plane images have drifted.
 # The pipeline cannot deploy Tier 2 VMs (it runs on them). If the MR
 # changes their images, the operator must deploy from the workstation

@@ -22,10 +22,10 @@ roles:
     category: nix
     host_config: site/nix/hosts/cicd.nix
     flake_output: cicd-image
-  pebble:
+  acme-dev:
     category: nix
-    host_config: site/nix/hosts/pebble.nix
-    flake_output: pebble-image
+    host_config: site/nix/hosts/acme-dev.nix
+    flake_output: acme-dev-image
   gatus:
     category: nix
     host_config: site/nix/hosts/gatus.nix

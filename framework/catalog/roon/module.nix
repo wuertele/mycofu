@@ -27,7 +27,7 @@
         roon-server = prev.roon-server.overrideAttrs (old: rec {
           version = "2.0-1641";
           src = prev.fetchurl {
-            url = "https://download.roonlabs.net/builds/RoonServer_linuxx64.tar.bz2";
+            url = "https://download.roonlabs.com/updates/production/RoonServer_linuxx64_206201641.tar.bz2";
             hash = "sha256-DX05i4bgTar2d2xHyEqFXNlQ86FladX/xoEC4YLIxnI=";
           };
         });
@@ -48,6 +48,7 @@
     environment.systemPackages = [ pkgs.roon-server ];
 
     # --- vdb mount at /var/lib/roon-server ---
+    mycofu.vdbMountPoint = "/var/lib/roon-server";
     fileSystems."/var/lib/roon-server" = {
       device = "/dev/disk/by-label/roon-data";
       fsType = "ext4";
@@ -108,9 +109,11 @@
       after = [
         "network-online.target"
         "var-lib-roon\\x2dserver.mount"
+        "vdb-ready.target"
       ];
       requires = [
         "var-lib-roon\\x2dserver.mount"
+        "vdb-ready.target"
       ];
       wants = [
         "network-online.target"

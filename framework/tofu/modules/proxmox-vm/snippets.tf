@@ -77,6 +77,39 @@ locals {
         permissions = "0444"
       }
     ] : [],
+    var.tailscale_auth_key != "" ? [
+      {
+        path        = "/run/secrets/tailscale/auth-key"
+        content     = var.tailscale_auth_key
+        permissions = "0400"
+      }
+    ] : [],
+    var.extra_ca_cert != "" ? [
+      {
+        path        = "/run/secrets/extra-ca-cert"
+        content     = var.extra_ca_cert
+        permissions = "0400"
+      }
+    ] : [],
+    var.vault_approle_role_id != "" ? [
+      {
+        path        = "/run/secrets/vault/role-id"
+        content     = var.vault_approle_role_id
+        permissions = "0400"
+      },
+      {
+        path        = "/run/secrets/vault/secret-id"
+        content     = var.vault_approle_secret_id
+        permissions = "0400"
+      }
+    ] : [],
+    var.vdb_restore_expected ? [
+      {
+        path        = "/run/secrets/vdb-restore-expected"
+        content     = "true"
+        permissions = "0444"
+      }
+    ] : [],
     var.write_files
   )
 }

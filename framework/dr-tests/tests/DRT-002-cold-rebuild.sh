@@ -70,14 +70,27 @@ echo "  Note: site/ already exists in the clone — new-site.sh will skip."
 echo "  This test validates rebuild-cluster.sh from a clean checkout."
 
 drt_step "Running rebuild-cluster.sh from temp clone"
+echo "  Using --override-branch-check: DR tests are disaster recovery scenarios."
 REBUILD_START=$(date +%s)
 drt_assert "rebuild-cluster.sh completes successfully" \
-  bash -c "cd '${TEMP_CLONE}/home-infrastructure' && framework/scripts/rebuild-cluster.sh"
+  bash -c "cd '${TEMP_CLONE}/home-infrastructure' && framework/scripts/rebuild-cluster.sh --override-branch-check"
 REBUILD_END=$(date +%s)
 REBUILD_ELAPSED=$(( REBUILD_END - REBUILD_START ))
 printf "  Rebuild took: %dm %ds\n" $((REBUILD_ELAPSED / 60)) $((REBUILD_ELAPSED % 60))
 
 # ── Verification ─────────────────────────────────────────────────────
+
+drt_step "Validating deploy manifest"
+MANIFEST="${TEMP_CLONE}/home-infrastructure/build/rebuild-manifest.json"
+drt_assert "rebuild-manifest.json exists" test -s "$MANIFEST"
+if [[ -s "$MANIFEST" ]]; then
+  drt_assert "manifest has override_branch_check=true" \
+    bash -c "jq -e '.override_branch_check == true' '$MANIFEST' >/dev/null"
+  drt_assert "manifest has non-empty commit" \
+    bash -c "jq -e '.commit != \"\" and .commit != null' '$MANIFEST' >/dev/null"
+  drt_assert "manifest has impact field" \
+    bash -c "jq -e '.impact != \"\" and .impact != null' '$MANIFEST' >/dev/null"
+fi
 
 drt_step "Running validate.sh (from original repo)"
 drt_assert "validate.sh passes after cold rebuild" framework/scripts/validate.sh

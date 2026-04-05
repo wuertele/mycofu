@@ -47,16 +47,29 @@ fi
 drt_step "Running rebuild-cluster.sh (full warm rebuild)"
 echo "  This will destroy all VMs and recreate them from the current commit."
 echo "  PBS backups taken above will be used to restore precious state."
+echo "  Using --override-branch-check: DR tests are disaster recovery scenarios."
 echo ""
 
 REBUILD_START=$(date +%s)
 drt_assert "rebuild-cluster.sh completes successfully" \
-  framework/scripts/rebuild-cluster.sh
+  framework/scripts/rebuild-cluster.sh --override-branch-check
 REBUILD_END=$(date +%s)
 REBUILD_ELAPSED=$(( REBUILD_END - REBUILD_START ))
 printf "  Rebuild took: %dm %ds\n" $((REBUILD_ELAPSED / 60)) $((REBUILD_ELAPSED % 60))
 
 # ── Verification ─────────────────────────────────────────────────────
+
+drt_step "Validating deploy manifest"
+MANIFEST="build/rebuild-manifest.json"
+drt_assert "rebuild-manifest.json exists" test -s "$MANIFEST"
+if [[ -s "$MANIFEST" ]]; then
+  drt_assert "manifest has override_branch_check=true" \
+    bash -c "jq -e '.override_branch_check == true' '$MANIFEST' >/dev/null"
+  drt_assert "manifest has non-empty commit" \
+    bash -c "jq -e '.commit != \"\" and .commit != null' '$MANIFEST' >/dev/null"
+  drt_assert "manifest has impact field" \
+    bash -c "jq -e '.impact != \"\" and .impact != null' '$MANIFEST' >/dev/null"
+fi
 
 drt_step "Running validate.sh"
 drt_assert "validate.sh passes after rebuild" framework/scripts/validate.sh

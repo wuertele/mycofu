@@ -114,25 +114,30 @@ fi
 # Check if already registered
 echo ""
 echo "=== Step 1: Check registration ==="
+SKIP_REGISTRATION=false
 if runner_ssh "test -f /etc/gitlab-runner/config.toml && grep -q token /etc/gitlab-runner/config.toml" 2>/dev/null; then
-  echo "  Runner already registered — skipping"
+  # Verify the token is actually accepted by GitLab
+  EXISTING_TOKEN=$(runner_ssh "grep 'token = ' /etc/gitlab-runner/config.toml | head -1 | sed 's/.*token = \"//;s/\"//' " 2>/dev/null || true)
+  VERIFY_RESULT=$(curl -sk --tls-max 1.2 -X POST "${GITLAB_URL}/api/v4/runners/verify" -F "token=${EXISTING_TOKEN}" 2>/dev/null)
+  if echo "$VERIFY_RESULT" | jq -e '.id' &>/dev/null; then
+    echo "  Runner already registered — skipping"
+    SKIP_REGISTRATION=true
+  else
+    echo "  config.toml exists but token is rejected by GitLab — removing stale config"
+    runner_ssh "rm -f /etc/gitlab-runner/config.toml" 2>/dev/null
+  fi
+fi
+
+if [[ "$SKIP_REGISTRATION" == "true" ]]; then
+  : # skip to TLS trust step
 else
   echo "  Registering runner..."
 
-  # Extract GitLab CA cert (needed for staging LE / Pebble certs).
-  # Use the IP directly — DNS may not be ready on a freshly rebuilt runner.
-  echo "  Extracting GitLab CA cert..."
-  runner_ssh "mkdir -p /etc/gitlab-runner && \
-    echo | openssl s_client -connect ${GITLAB_IP}:443 -showcerts 2>/dev/null | \
-    awk '/-----BEGIN CERTIFICATE-----/,/-----END CERTIFICATE-----/' > /etc/gitlab-runner/gitlab-ca.pem" 2>/dev/null || true
-
-  # Verify the cert was actually extracted
-  if ! runner_ssh "test -s /etc/gitlab-runner/gitlab-ca.pem" 2>/dev/null; then
-    echo "ERROR: Failed to extract GitLab CA certificate" >&2
-    echo "GitLab may not be accessible from the runner at ${GITLAB_IP}:443" >&2
-    exit 1
-  fi
-  echo "  CA cert extracted"
+  # The runner uses the system CA bundle for TLS trust (no pinned cert).
+  # The system bundle includes ISRG Root X1 (Let's Encrypt) and, on dev
+  # VMs, the step-ca root (added by extra-ca-bundle service). This
+  # eliminates stale trust when GitLab's cert changes.
+  runner_ssh "mkdir -p /etc/gitlab-runner"
 
   # Build registration command helper
   build_register_cmd() {
@@ -142,8 +147,7 @@ else
       --non-interactive \
       --url '${GITLAB_URL}' \
       --token '${token}' \
-      --executor shell \
-      --tls-ca-file /etc/gitlab-runner/gitlab-ca.pem"
+      --executor shell"
   }
 
   REGISTER_OUTPUT=$(runner_ssh "$(build_register_cmd "$RUNNER_TOKEN")" 2>&1) || true
@@ -202,21 +206,11 @@ else
   echo "  Runner registered"
 fi
 
-# Ensure the runner trusts GitLab's TLS certificate.
-# With LE staging certs (or any non-standard CA), the runner needs
-# the CA cert to verify the connection for ongoing job polling.
-echo ""
-echo "=== Step 1b: Configure TLS trust ==="
-runner_ssh "echo | openssl s_client -connect ${GITLAB_IP}:443 -showcerts 2>/dev/null | \
-  awk '/-----BEGIN CERTIFICATE-----/,/-----END CERTIFICATE-----/' > /etc/gitlab-runner/gitlab-ca.pem"
-if runner_ssh "test -s /etc/gitlab-runner/gitlab-ca.pem" 2>/dev/null; then
-  # Add tls-ca-file to config.toml if not already present
-  if ! runner_ssh "grep -q 'tls-ca-file' /etc/gitlab-runner/config.toml" 2>/dev/null; then
-    runner_ssh "sed -i '/^\[\[runners\]\]/a\\  tls-ca-file = \"/etc/gitlab-runner/gitlab-ca.pem\"' /etc/gitlab-runner/config.toml"
-  fi
-  echo "  GitLab CA cert configured for runner"
-else
-  echo "  WARNING: Could not extract GitLab CA cert"
+# Remove any legacy pinned CA cert from config.toml. The runner now uses
+# the system CA bundle (see comment in registration section above).
+if runner_ssh "grep -q 'tls-ca-file' /etc/gitlab-runner/config.toml" 2>/dev/null; then
+  runner_ssh "sed -i '/tls-ca-file/d' /etc/gitlab-runner/config.toml"
+  echo "  Removed legacy tls-ca-file from config.toml (using system CA bundle)"
 fi
 
 # Start/restart the runner service

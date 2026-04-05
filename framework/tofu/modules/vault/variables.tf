@@ -69,12 +69,12 @@ variable "pdns_api_key" {
 }
 
 variable "acme_server_url" {
-  description = "ACME directory URL (Pebble in dev, Let's Encrypt in prod)"
+  description = "ACME directory URL (step-ca in dev, Let's Encrypt in prod)"
   type        = string
 }
 
-variable "acme_ca_cert" {
-  description = "PEM content of the ACME CA cert (empty = use system CA bundle)"
+variable "extra_ca_cert" {
+  description = "PEM content of the extra CA root delivered via CIDATA (empty = no extra CA)"
   type        = string
   default     = ""
 }
@@ -113,3 +113,9 @@ variable "search_domain" {
   default     = ""
 }
 
+
+variable "vdb_restore_expected" {
+  description = "Whether vdb requires PBS restore"
+  type        = bool
+  default     = false
+}

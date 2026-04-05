@@ -25,7 +25,7 @@ variable "mac_address" {
 }
 
 variable "image" {
-  description = "Proxmox file ID for the Pebble image"
+  description = "Proxmox file ID for the dev ACME image"
   type        = string
 }
 
@@ -46,13 +46,14 @@ variable "storage_pool" {
   default     = "local-zfs"
 }
 
-variable "dns_server" {
-  description = "IP address of the authoritative DNS server for ACME challenge verification"
-  type        = string
-}
-
 variable "domain" {
   description = "Base domain (written to CIDATA to trigger recreation on domain change)"
+  type        = string
+  default     = ""
+}
+
+variable "extra_ca_cert" {
+  description = "PEM content of the extra CA root delivered via CIDATA (empty = no extra CA)"
   type        = string
   default     = ""
 }
@@ -78,4 +79,3 @@ variable "search_domain" {
   type        = string
   default     = ""
 }
-

@@ -63,6 +63,7 @@ in
   imports = [ ./certbot.nix ];
 
   # Mount data disk at /var/lib/testapp (overrides base.nix /var/lib/data)
+  mycofu.vdbMountPoint = "/var/lib/testapp";
   fileSystems."/var/lib/testapp" = {
     device = "/dev/sdb";
     fsType = "ext4";
@@ -95,8 +96,8 @@ in
   # Heartbeat writer (timer)
   systemd.services.testapp-heartbeat = {
     description = "Testapp heartbeat writer";
-    after = [ "var-lib-testapp.mount" ];
-    requires = [ "var-lib-testapp.mount" ];
+    after = [ "var-lib-testapp.mount" "vdb-ready.target" ];
+    requires = [ "var-lib-testapp.mount" "vdb-ready.target" ];
     serviceConfig = {
       Type = "oneshot";
       ExecStart = heartbeatScript;

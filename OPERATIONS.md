@@ -38,7 +38,16 @@ framework/scripts/rebalance-cluster.sh
 framework/scripts/configure-replication.sh "*"
 
 # Rebuild the entire cluster from bare Proxmox
+# (must be on prod branch for routine use; see Full Disaster Recovery for override)
+git checkout prod
 framework/scripts/rebuild-cluster.sh
+
+# Rebuild control-plane VMs only (gitlab, cicd, pbs) — must be on prod branch
+git checkout prod
+framework/scripts/rebuild-cluster.sh --scope control-plane
+
+# Disaster recovery rebuild (override branch safety when GitLab is down)
+framework/scripts/rebuild-cluster.sh --override-branch-check
 
 # Reset cluster to factory state (destructive!)
 framework/scripts/reset-cluster.sh --confirm
@@ -273,11 +282,18 @@ the infrastructure it runs on. When a commit changes a control-plane VM
 image (new NixOS module, base.nix change, etc.), the pipeline correctly
 blocks deployment with a BLOCKED message from `safe-apply.sh`.
 
-Deploy from the workstation:
+Deploy from the workstation — **you must be on the `prod` branch:**
 
 ```bash
-framework/scripts/rebuild-cluster.sh
+git checkout prod
+framework/scripts/rebuild-cluster.sh --scope control-plane
 ```
+
+`rebuild-cluster.sh` enforces branch safety: it refuses prod-affecting or
+control-plane scope from a non-prod branch, exiting before any build or
+apply. If you're on `dev`, the script will tell you to switch to `prod`.
+Use `--override-branch-check` only for genuine disaster recovery (see
+Full Disaster Recovery below).
 
 `rebuild-cluster.sh` is idempotent — it skips completed steps (networking,
 storage, cluster are already done) and deploys the changed VMs. If a
@@ -308,11 +324,6 @@ When `tofu apply` recreates a VM (new image hash, CIDATA change, etc.),
 5. GitLab configuration and runner registration (if GitLab was recreated)
 6. Three-gate backup validation
 
-**DR test scripts:** `framework/dr-tests/` contains test scripts for
-each recovery scenario. Run them after changes that touch backup,
-restore, or rebuild paths. See `DR-REGISTRY.md` for which tests to
-run after each type of change.
-
 For manual workstation deploys outside `rebuild-cluster.sh` (not
 recommended), the individual steps are:
 
@@ -338,6 +349,167 @@ it.
   (VM exists but tofu doesn't know about it), resource conflict, provider error.
 - **Validation failure:** Check which `validate.sh` check failed. Fix the
   underlying issue, don't skip the check.
+- **Control-plane drift:** See the dedicated section below.
+
+### Control-Plane Drift
+
+**What it is**
+
+Control-plane VMs — gitlab, cicd, and pbs — are not deployed by the
+automated pipeline. They run shared infrastructure that both environments
+depend on, and the pipeline runs on them (GitLab hosts the pipeline; the
+cicd runner executes it). They can only be deployed from the operator's
+workstation.
+
+Control-plane drift means the running VMs no longer match what the current
+git commit specifies — either the OS image hash has changed (a NixOS module
+update), or the CIDATA content has changed (a new secret, config value, or
+credentials added via `write_files`). Any change to CIDATA triggers VM
+recreation, which destroys and recreates the VM including its data disk (vdb).
+
+**When you'll see it**
+
+The post-merge dev pipeline fails at the test/validate stage with a message
+identifying which control-plane VMs have drift and what kind (image, CIDATA,
+or both). The prod pipeline also fails at validation, blocking promotion until
+drift is resolved.
+
+**Why you must follow the sequence carefully**
+
+The remediation sequence is: backup → rebuild → verify. Each step matters:
+
+- **Backup first, always.** `rebuild-cluster.sh --scope control-plane`
+  destroys and recreates gitlab, which loses vdb. The only recovery path
+  is the PBS backup taken before the destroy. If you skip the backup and
+  the rebuild fails partway through, there is no recovery.
+
+- **Verify the backup before destroying anything.** After running
+  `backup-now.sh`, confirm it exited 0 and check that the PBS timestamp
+  is recent. A backup job that ran on a VM with empty state creates a
+  useless backup. The backup must contain real data.
+
+- **Verify the restore before declaring success.** After the rebuild
+  completes, confirm GitLab has your expected data — check that your
+  git repositories exist, that your issue count is plausible, that
+  pipelines can run. Do not re-trigger the pipeline until you have
+  verified the restore.
+
+**Remediation sequence**
+
+```bash
+# Step 1: Switch to the prod branch (rebuild-cluster.sh enforces this)
+git checkout prod
+
+# Step 2: Take and verify a backup
+framework/scripts/backup-now.sh
+# Must exit 0. If it fails, stop — check PBS before proceeding.
+
+# Step 2: Verify the backup contains real data (not empty state)
+# Check the PBS timestamp — it should be from just now
+# Check backup size — it should be similar to previous backups for this VM
+# If in doubt, run DRT-007 (backup spot-check) before destroying anything
+
+# Step 3: Rebuild control-plane VMs from workstation
+framework/scripts/rebuild-cluster.sh --scope control-plane
+# This will: stop the VMs, destroy them, recreate with current images,
+# restore vdb from PBS, reconnect the runner if cicd was rebuilt.
+# Estimated time: 15-25 minutes.
+
+# Step 4: Verify the restore
+GITLAB_IP=$(yq '.vms.gitlab.ip' site/config.yaml)
+ssh root@${GITLAB_IP} \
+  "su -s /bin/sh postgres -c \"psql -d gitlab -tAc 'SELECT COUNT(*) FROM projects;'\""
+# Must return a non-zero count matching your expected number of projects.
+
+# Step 5: Run validate.sh to confirm full cluster health
+framework/scripts/validate.sh
+# Must pass all checks before re-triggering the pipeline.
+
+# Step 6: Re-trigger the failed pipeline in GitLab UI
+# Or push an empty commit to re-run:
+git commit --allow-empty -m "ci: re-trigger after control-plane rebuild"
+git push gitlab dev
+```
+
+**If cicd was rebuilt**
+
+The CI/CD runner must be re-registered after cicd recreation:
+
+```bash
+framework/scripts/register-runner.sh
+```
+
+The `rebuild-cluster.sh --scope control-plane` script should do this
+automatically, but verify the runner is online in GitLab before
+re-triggering the pipeline (Settings → CI/CD → Runners).
+
+**If the rebuild fails partway through**
+
+Stop. Do not run more commands. Identify the last known-good PBS backup
+timestamps for each precious-state VM:
+
+```bash
+# List available backups per VM
+FIRST_NODE=$(yq '.nodes[0].mgmt_ip' site/config.yaml)
+ssh root@${FIRST_NODE} \
+  "pvesh get /nodes/pve01/storage/pbs-nas/content --output-format json" \
+  | jq -r '.[] | "\(.vmid) \(.ctime | strftime("%Y-%m-%dT%H:%M:%SZ")) \(.size)"' \
+  | sort
+```
+
+Do not run `backup-now.sh` or let scheduled PBS jobs run until the VMs
+have verified real state. A backup of empty state overwrites the recoverable
+backup.
+
+See the Break-Glass Procedures section for full recovery from a failed
+rebuild.
+
+**Nuances an experienced operator knows**
+
+The following are not obvious and have caused incidents in this system:
+
+- The latest PBS backup may not be the best backup to restore from. If a
+  previous rebuild failed and created backup jobs before the restore was
+  verified, the latest backup may contain empty state. Always check the
+  backup timestamp and size before restoring.
+
+- CIDATA drift does not change the NixOS image hash. The pre-deploy image
+  drift warning checks image hashes only — it will not warn about CIDATA
+  changes. CIDATA drift is caught by the post-deploy validation (R7.2).
+  If the pipeline fails after deploy with a CIDATA drift message but no
+  image drift warning appeared, this is expected behavior, not a bug.
+
+- PBS is not a NixOS VM and does not have a NixOS image. PBS config
+  changes are deployed in-place with a targeted tofu apply, not via
+  `rebuild-cluster.sh`. If the drift message identifies PBS only, the
+  remediation is different:
+  ```bash
+  framework/scripts/tofu-wrapper.sh apply -target=module.pbs
+  ```
+  This does not destroy PBS or require a backup.
+
+- vault-dev is not in the control-plane group and is deployed by the
+  pipeline. If vault-dev drifts, the pipeline handles it automatically.
+
+- **Never run `tofu apply` from the workstation without first verifying
+  that `site/tofu/image-versions.auto.tfvars` contains real image hashes.**
+  When this file is missing, `tofu-wrapper.sh` generates a placeholder with
+  empty image paths (`local:iso/` with no filename). Running tofu apply with
+  a placeholder destroys every VM whose image path changed — all of them —
+  then fails to create them because the image file doesn't exist. If the file
+  is missing or was deleted, download it from the last pipeline's build
+  artifacts (GitLab CI → build:images → Artifacts) before running any
+  workstation tofu apply. Deleting the file to "clear" it is never the right
+  approach — it is a transient build artifact that only exists during an active
+  build+deploy session.
+
+- **`site/config.yaml` is part of the branch.** All CIDATA content — VM IPs,
+  MACs, VMIDs, DNS zone content, ACME server URL, Vault endpoints — is derived
+  from config.yaml via OpenTofu. If dev and prod branches have diverged on
+  config.yaml, deploying prod VMs from the dev branch produces VMs with
+  incorrect CIDATA. `rebuild-cluster.sh` warns about config.yaml divergence
+  between your current commit and `gitlab/prod` when `--override-branch-check`
+  is used.
 
 ### Vault is Sealed
 
@@ -435,6 +607,53 @@ ssh root@<dns-vm-ip> "pdnsutil list-zone <env>.<domain>"
 DNS zone data is loaded from CIDATA at boot. If a record is missing, check
 config.yaml and redeploy the DNS VM (zone data is regenerated from config.yaml
 on every deploy).
+
+### Tailscale Identity Lost or Mismatched
+
+If a Tailscale-enabled VM fails to rejoin the tailnet with its expected
+identity (appears as a new machine in Tailscale admin, or `tailscale status`
+shows a different node ID than before), the node identity in Vault may be
+stale, corrupt, or missing.
+
+**Check the current state:**
+```bash
+# On the affected VM
+tailscale status --json | jq '{BackendState, Self: .Self.ID}'
+
+# In Vault
+vault kv get secret/tailscale/nodes/<domain>/<vmrole>
+```
+
+**Recovery: clear the Vault identity and let the VM re-join fresh**
+
+```bash
+# Delete the stale identity from Vault
+vault kv delete secret/tailscale/nodes/<domain>/<vmrole>
+
+# Restart tailscale services on the VM to trigger a fresh join
+ssh root@<vm-mgmt-ip> "systemctl restart tailscale-identity-restore tailscale tailscale-vault-sync"
+```
+
+After a fresh join:
+- The VM appears in Tailscale admin as a new machine with the same name
+  (`<vmrole>-<domain-with-dashes>`) — the old entry can be removed from
+  the Tailscale admin console
+- The new identity is written back to Vault automatically
+- Any per-machine ACL rules in Tailscale admin must be re-applied if you
+  use per-machine rules (prefer tag-based rules which survive identity
+  changes automatically)
+
+**If the auth key is rejected (403 from Tailscale):**
+
+The reusable auth key in Vault may have been revoked or expired.
+Generate a new key in the Tailscale admin console and update Vault:
+
+```bash
+vault kv put secret/tailscale auth_key="tskey-auth-XXXXXX"
+```
+
+VMs will pick up the new key on next vault-agent refresh cycle (within
+24 hours, or immediately after a service restart).
 
 ---
 
@@ -548,7 +767,18 @@ protection against this scenario (see the Continuous section above).
 | Monthly | Backup restore spot-check (restore one VM's vdb to a temp VM, verify application starts) |
 | Quarterly | Prod verification drills (DNS failover, Vault restart, node evacuation) |
 | Annually | Bootstrap secret rotation (or on suspected compromise) |
-| After significant changes | Run invalidated DR tests per `framework/dr-tests/DR-REGISTRY.md` |
+
+### ACME Staging for DR Tests
+
+**During DR tests that involve full cluster rebuilds (DRT-001, DRT-008):**
+Set `acme: staging` in `site/config.yaml` before running
+`rebuild-cluster.sh`. The Let's Encrypt production server rate-limits
+duplicate certificate issuance to 5 per 168 hours — a troubled rebuild
+session that issues multiple certs for the same domain can exhaust this
+limit and leave the cluster without valid TLS for up to 7 days.
+The staging server has no rate limit and its certs work for all cluster
+purposes (ACME challenge validation, Vault TLS auth, nginx) except
+browser trust. Set `acme: production` when promoting to prod.
 
 ---
 
@@ -591,6 +821,44 @@ yq '.applications | to_entries | .[] | .value.environments.prod.ip + " " + .key'
 See architecture.md section 13.4 for details. See architecture.md section
 13.5 for the multi-level reset model.
 
+**Routine control-plane maintenance (GitLab is up, planned operation):**
+
+```bash
+git checkout prod
+framework/scripts/backup-now.sh
+framework/scripts/rebuild-cluster.sh --scope control-plane
+```
+
+**Initial cluster deployment (no existing cluster):**
+
+```bash
+# Any branch — branch check is automatically skipped when no deployment exists
+framework/scripts/rebuild-cluster.sh
+```
+
+The script detects "no existing deployment" (empty tofu state and no
+configured VMs in Proxmox) and skips the branch check with an informational
+message. No `--override-branch-check` is needed for a first-time deploy.
+
+**Disaster recovery (cluster down, GitLab may be unreachable):**
+
+First choice — use the prod commit if you have it locally:
+```bash
+git checkout gitlab/prod   # or: git checkout prod if local is current
+framework/scripts/rebuild-cluster.sh
+```
+
+Second choice — if you don't know which commit was prod or GitLab is down:
+```bash
+framework/scripts/rebuild-cluster.sh --override-branch-check
+```
+
+With `--override-branch-check`, the script prints your current commit and the
+last known prod commit (from `gitlab/prod` ref, if available), warns if
+`site/config.yaml` differs between the two commits (different CIDATA for prod
+VMs), skips the GitLab push and pipeline wait, and prints post-DR
+reconciliation instructions at the end.
+
 **If secrets survive (Levels 0–2):**
 
 1. Reinstall Proxmox on all nodes (set management IPs from config.yaml)
@@ -617,6 +885,30 @@ contain state encrypted with/keyed to the old secrets. `rebuild-cluster.sh`
 handles this gracefully — Vault auto-recovers from token mismatches, and
 the pre-backup gate detects empty VMs. All services initialize fresh.
 
+**After DR with override — reconciliation required:**
+
+After rebuilding with `--override-branch-check`, prod VMs may be running code
+from the recovery branch rather than the prod branch. Once GitLab is back:
+
+```bash
+# 1. Verify data integrity
+framework/scripts/validate.sh
+
+# 2. Push the recovery commit to GitLab dev
+git push gitlab HEAD:dev
+
+# 3. Create a dev→prod MR in GitLab and merge it
+
+# 4. Let the pipeline redeploy from the correct branches
+
+# 5. Take a backup after the pipeline completes
+framework/scripts/backup-now.sh
+```
+
+Until reconciliation completes, prod VMs run the recovery branch code rather
+than the prod-branch code. This is acceptable during recovery but should be
+resolved as soon as GitLab is available.
+
 **What you need to recover from anything:**
 - The git repository (in git — contains `site/config.yaml`,
   `site/applications.yaml`, all NixOS configs, encrypted secrets,
@@ -634,7 +926,9 @@ rebuild.
 | Command | Purpose |
 |---------|---------|
 | `validate.sh` | Run all health checks including backup freshness (must pass before declaring work done) |
-| `rebuild-cluster.sh` | Full rebuild from bare Proxmox nodes — includes PBS restore, three-gate backup verification, and all post-deploy steps |
+| `rebuild-cluster.sh` | Full rebuild from bare Proxmox nodes — must be on `prod` branch for routine use. Includes PBS restore, three-gate backup verification, and all post-deploy steps |
+| `rebuild-cluster.sh --scope control-plane` | Rebuild only gitlab, cicd, and pbs. Must be on `prod` branch. |
+| `rebuild-cluster.sh --override-branch-check` | Override branch safety for disaster recovery. Prints last-known-prod comparison and post-DR reconciliation instructions. |
 | `reset-cluster.sh [--confirm]` | Multi-level reset: `--vms` (VMs only), `--storage` (+ pools), `--cluster` (+ boot drives, requires Proxmox reinstall), `--secrets` (age key + secrets.yaml), `--nas` (PBS backups + PostgreSQL). Without --confirm: dry run |
 | `rebalance-cluster.sh [--dry-run]` | Migrate VMs back to intended nodes after HA failover |
 | `configure-replication.sh "*"` | Clean orphan zvols, recreate replication jobs |

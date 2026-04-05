@@ -426,6 +426,7 @@ framework/scripts/generate-bringup.sh
 framework/scripts/bootstrap-sops.sh
 
 # Build everything: images, VMs, DNS, certs, Vault, services
+# (initial deploy: any branch — branch check skipped automatically when no cluster exists)
 framework/scripts/rebuild-cluster.sh
 ```
 

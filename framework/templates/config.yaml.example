@@ -33,7 +33,7 @@ timezone: "UTC"
 # "staging"    — Let's Encrypt staging server. Untrusted certificates.
 #                Rate limit: 30,000 per domain per week. Use during initial
 #                setup and testing to avoid hitting production rate limits.
-# Dev environment always uses Pebble regardless of this setting.
+# Dev environment always uses the local step-ca regardless of this setting.
 # OPTIONAL: defaults to "production"
 acme: production
 
@@ -281,7 +281,7 @@ vms:
     ip: 10.0.20.52
     mac: "02:00:00:00:02:03"           # Replace with generated MAC
     node: node3
-  pebble:
+  acme_dev:
     vmid: 305
     ip: 10.0.20.53
     mac: "02:00:00:00:02:04"           # Replace with generated MAC

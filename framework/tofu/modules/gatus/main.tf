@@ -14,19 +14,20 @@ terraform {
 module "gatus" {
   source = "../proxmox-vm"
 
-  vm_id         = var.vm_id
-  vm_name       = "gatus"
-  hostname      = "gatus"
-  instance_id   = "gatus-prod"
-  target_node    = var.target_node
-  all_node_names = var.all_node_names
-  image_file_id = var.image
-  vlan_id       = var.vlan_id
-  mac_address   = var.mac_address
-  ssh_pubkey    = var.ssh_pubkey
+  vm_id               = var.vm_id
+  vm_name             = "gatus"
+  hostname            = "gatus"
+  instance_id         = "gatus-prod"
+  target_node         = var.target_node
+  all_node_names      = var.all_node_names
+  image_file_id       = var.image
+  vlan_id             = var.vlan_id
+  mac_address         = var.mac_address
+  ssh_pubkey          = var.ssh_pubkey
   operator_ssh_pubkey = var.operator_ssh_pubkey
-  storage_pool  = var.storage_pool
-  domain        = var.domain
+  storage_pool        = var.storage_pool
+  domain              = var.domain
+  extra_ca_cert       = var.extra_ca_cert
 
   ip_address    = var.ip_address
   gateway       = var.gateway
@@ -38,6 +39,9 @@ module "gatus" {
   cores       = 1
   vdb_size_gb = 0
   ha_enabled  = true
+
+  vault_approle_role_id   = var.vault_approle_role_id
+  vault_approle_secret_id = var.vault_approle_secret_id
 
   write_files = [
     {

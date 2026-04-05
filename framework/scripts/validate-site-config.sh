@@ -119,11 +119,12 @@ while IFS= read -r line; do
 done <<< "$LEGACY_APP_DATA"
 
 # Check for duplicate VMIDs
-echo -e "$ALL_VMIDS" | awk '{print $2}' | sort | uniq -d | while IFS= read -r dup; do
+DUP_VMIDS=$(echo -e "$ALL_VMIDS" | awk 'NF{print $2}' | sort | uniq -d || true)
+while IFS= read -r dup; do
   [[ -z "$dup" ]] && continue
   owners=$(echo -e "$ALL_VMIDS" | grep " ${dup} " | awk '{print $1 "(" $3 ")"}' | tr '\n' ', ' | sed 's/,$//')
   err "Duplicate VMID ${dup}: ${owners}"
-done
+done <<< "$DUP_VMIDS"
 
 # --- VMID range checks for application VMs ---
 while IFS= read -r line; do
@@ -166,11 +167,12 @@ done <<< "$APP_DATA"
 
 # Check duplicates within each environment
 for check_env in prod dev shared; do
-  echo -e "$ALL_IPS" | grep " ${check_env} " | awk '{print $2}' | sort | uniq -d | while IFS= read -r dup; do
+  DUP_IPS=$(echo -e "$ALL_IPS" | grep " ${check_env} " | awk '{print $2}' | sort | uniq -d || true)
+  while IFS= read -r dup; do
     [[ -z "$dup" ]] && continue
     owners=$(echo -e "$ALL_IPS" | grep " ${dup} ${check_env} " | awk '{print $1 "(" $4 ")"}' | tr '\n' ', ' | sed 's/,$//')
     err "Duplicate IP ${dup} in ${check_env}: ${owners}"
-  done
+  done <<< "$DUP_IPS"
 done
 
 # --- MAC uniqueness ---
@@ -191,11 +193,12 @@ while IFS= read -r line; do
   ALL_MACS="${ALL_MACS}${name} ${mac} applications.yaml\n"
 done <<< "$APP_DATA"
 
-echo -e "$ALL_MACS" | awk '{print $2}' | sort | uniq -d | while IFS= read -r dup; do
+DUP_MACS=$(echo -e "$ALL_MACS" | awk 'NF{print $2}' | sort | uniq -d || true)
+while IFS= read -r dup; do
   [[ -z "$dup" ]] && continue
   owners=$(echo -e "$ALL_MACS" | grep " ${dup} " | awk '{print $1 "(" $3 ")"}' | tr '\n' ', ' | sed 's/,$//')
   err "Duplicate MAC ${dup}: ${owners}"
-done
+done <<< "$DUP_MACS"
 
 # --- IP subnet membership ---
 if [[ -f "$APPS_CONFIG" ]]; then

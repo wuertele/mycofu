@@ -7,7 +7,7 @@
 #   FQDN:        hostname (from /etc/hostname) + search domain (from /etc/resolv.conf)
 #   ACME server: /run/secrets/certbot/acme-server-url (injected by nocloud-init)
 #   API key:     /run/secrets/certbot/pdns-api-key (injected by nocloud-init)
-#   CA cert:     /run/secrets/certbot/acme-ca-cert (optional, injected for dev/Pebble)
+#   CA bundle:   /etc/ssl/certs/ca-certificates.crt (rewritten by extra-ca-bundle on dev)
 #
 # Certificate output: /etc/letsencrypt/live/<fqdn>/
 #   cert.pem, chain.pem, fullchain.pem, privkey.pem
@@ -26,12 +26,23 @@ let
   authHook = wrapHook "certbot-auth-hook" "${hookScriptsDir}/certbot-auth-hook.sh";
   cleanupHook = wrapHook "certbot-cleanup-hook" "${hookScriptsDir}/certbot-cleanup-hook.sh";
 
+  caBundlePath = "/etc/ssl/certs/ca-certificates.crt";
+
   # Script to discover FQDN and run certbot
   certbotRunScript = pkgs.writeShellScript "certbot-run" ''
     set -euo pipefail
     export PATH=${lib.makeBinPath [
-      pkgs.certbot pkgs.curl pkgs.coreutils pkgs.gnugrep pkgs.gawk pkgs.inetutils
+      pkgs.certbot pkgs.curl pkgs.coreutils pkgs.gnugrep pkgs.gawk pkgs.inetutils pkgs.findutils
     ]}:$PATH
+
+    # Clean up stale certbot account data after PBS restore (#165).
+    # PBS may restore /etc/letsencrypt/accounts/ with an empty regr.json,
+    # causing certbot to crash with DeserializationError. Deleting the
+    # accounts directory forces certbot to register a fresh ACME account.
+    if find /etc/letsencrypt/accounts -name 'regr.json' -empty 2>/dev/null | grep -q .; then
+      echo "WARNING: Found empty regr.json in certbot accounts — removing stale account data"
+      rm -rf /etc/letsencrypt/accounts
+    fi
 
     # Discover FQDN: check explicit file first, then hostname + search domain.
     # Management-network VMs inject /run/secrets/certbot/fqdn via write_files
@@ -64,12 +75,10 @@ let
     fi
     ACME_SERVER=$(cat /run/secrets/certbot/acme-server-url | tr -d '[:space:]')
 
-    # Check for custom CA cert (Pebble in dev)
-    EXTRA_ARGS=()
-    if [ -f /run/secrets/certbot/acme-ca-cert ]; then
-      # certbot (via python requests) uses REQUESTS_CA_BUNDLE for TLS trust
-      export REQUESTS_CA_BUNDLE=/run/secrets/certbot/acme-ca-cert
-    fi
+    # requests may still use certifi depending on the Python packaging path.
+    # Point it at the standard bundle path, which extra-ca-bundle rewrites
+    # to the combined bundle on dev and leaves untouched on prod.
+    export REQUESTS_CA_BUNDLE=${caBundlePath}
 
     # Run certbot
     certbot certonly \
@@ -81,8 +90,7 @@ let
       --manual-auth-hook "${authHook}" \
       --manual-cleanup-hook "${cleanupHook}" \
       --server "$ACME_SERVER" \
-      --domain "$FQDN" \
-      "''${EXTRA_ARGS[@]}"
+      --domain "$FQDN"
 
     echo "Certificate issued successfully for $FQDN"
   '';
@@ -94,29 +102,75 @@ let
       pkgs.certbot pkgs.curl pkgs.coreutils pkgs.gnugrep pkgs.gawk
     ]}:$PATH
 
-    # Set CA bundle for Pebble trust if present
-    if [ -f /run/secrets/certbot/acme-ca-cert ]; then
-      export REQUESTS_CA_BUNDLE=/run/secrets/certbot/acme-ca-cert
-    fi
+    export REQUESTS_CA_BUNDLE=${caBundlePath}
 
     certbot renew --non-interactive
   '';
+  # If the VM has a vdb data disk, persist /etc/letsencrypt on it so certs
+  # survive VM recreation and PBS restore. This prevents LE rate limit
+  # exhaustion during development rebuilds (#165).
+  vdbMountPoint = config.mycofu.vdbMountPoint or "";
+  hasVdb = vdbMountPoint != "";
 in
 {
   # certbot package
   environment.systemPackages = [ pkgs.certbot ];
+
+  # Persist /etc/letsencrypt on vdb when available. On VMs without vdb,
+  # /etc/letsencrypt is a normal directory on vda (lost on rebuild).
+  systemd.services.certbot-persist-certs = lib.mkIf hasVdb {
+    description = "Symlink /etc/letsencrypt to vdb for cert persistence";
+    wantedBy = [ "multi-user.target" ];
+    after = [ "local-fs.target" ];
+    before = [ "certbot-initial.service" "certbot-renew.service" ];
+
+    serviceConfig = {
+      Type = "oneshot";
+      RemainAfterExit = true;
+    };
+
+    path = [ pkgs.coreutils ];
+
+    script = ''
+      VDB_LE="${vdbMountPoint}/letsencrypt"
+
+      # Create the directory on vdb if it doesn't exist
+      mkdir -p "$VDB_LE"
+
+      # If /etc/letsencrypt is a real directory (first boot after image
+      # change, or legacy VM), move any existing content to vdb
+      if [ -d /etc/letsencrypt ] && [ ! -L /etc/letsencrypt ]; then
+        # Move existing cert data to vdb (preserves certs from first boot
+        # if certbot ran before this service existed)
+        if [ "$(ls -A /etc/letsencrypt 2>/dev/null)" ]; then
+          cp -a /etc/letsencrypt/. "$VDB_LE/"
+        fi
+        rm -rf /etc/letsencrypt
+      fi
+
+      # Create the symlink if it doesn't exist or points elsewhere
+      if [ ! -L /etc/letsencrypt ] || [ "$(readlink /etc/letsencrypt)" != "$VDB_LE" ]; then
+        rm -f /etc/letsencrypt
+        ln -s "$VDB_LE" /etc/letsencrypt
+        echo "Symlinked /etc/letsencrypt -> $VDB_LE"
+      else
+        echo "/etc/letsencrypt already symlinked to $VDB_LE"
+      fi
+    '';
+  };
 
   # Initial certificate request — runs once on first boot
   systemd.services.certbot-initial = {
     description = "Initial ACME certificate request";
     wantedBy = [ "multi-user.target" ];
     after = [
+      "extra-ca-bundle.service"
       "network-online.target"
       "nocloud-init.service"
       "nss-lookup.target"
-    ];
-    wants = [ "network-online.target" "nss-lookup.target" ];
-    requires = [ "nocloud-init.service" ];
+    ] ++ lib.optionals hasVdb [ "certbot-persist-certs.service" ];
+    wants = [ "extra-ca-bundle.service" "network-online.target" "nss-lookup.target" ];
+    requires = [ "nocloud-init.service" ] ++ lib.optionals hasVdb [ "certbot-persist-certs.service" ];
 
     # Only run if no certificate exists yet
     serviceConfig = {
@@ -163,11 +217,12 @@ in
   systemd.services.certbot-renew = {
     description = "Certbot certificate renewal";
     after = [
+      "extra-ca-bundle.service"
       "network-online.target"
       "nocloud-init.service"
       "nss-lookup.target"
-    ];
-    wants = [ "network-online.target" "nss-lookup.target" ];
+    ] ++ lib.optionals hasVdb [ "certbot-persist-certs.service" ];
+    wants = [ "extra-ca-bundle.service" "network-online.target" "nss-lookup.target" ];
     serviceConfig = {
       Type = "oneshot";
       ExecStart = certbotRenewScript;

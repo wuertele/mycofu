@@ -9,6 +9,7 @@
 #   framework/scripts/rebuild-cluster.sh --scope data-plane        # everything except control-plane
 #   framework/scripts/rebuild-cluster.sh --scope vm=gitlab,cicd    # specific VMs
 #   framework/scripts/rebuild-cluster.sh --allow-dirty             # proceed with dirty git tree
+#   framework/scripts/rebuild-cluster.sh --override-branch-check   # allow prod/shared DR from non-prod
 #
 # Prerequisites:
 #   - operator.age.key on the workstation
@@ -38,11 +39,14 @@ LOG_FILE="${LOG_DIR}/rebuild.log"
 BUILD_MARKER="${LOG_DIR}/.build-complete"
 
 ALLOW_DIRTY=0
+OVERRIDE_BRANCH_CHECK=0
 STAGING_CERTS=0
 SCOPE=""
+source "${SCRIPT_DIR}/git-deploy-context.sh"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --allow-dirty) ALLOW_DIRTY=1; shift ;;
+    --override-branch-check) OVERRIDE_BRANCH_CHECK=1; shift ;;
     --scope) SCOPE="$2"; shift 2 ;;
     --staging-certs) echo "NOTE: --staging-certs is deprecated. Set 'acme: staging' in site/config.yaml instead."; shift ;;
     --help|-h)
@@ -56,6 +60,10 @@ done
 # --- Scope definitions ---
 TOFU_TARGETS=""
 CONTROL_PLANE_MODULES="module.gitlab module.cicd module.pbs"
+
+# Tracks VMs restored by the atomic per-VM rebuild loop.
+# Step 7.6 checks this before restoring to avoid a redundant second restore.
+ATOMICALLY_RESTORED=""
 if [[ -n "$SCOPE" ]]; then
   case "$SCOPE" in
     control-plane)
@@ -143,6 +151,13 @@ step_skip() {
   STEP_RESULTS+=("$1: SKIPPED — $2")
 }
 die() { log "FATAL: $*"; exit 1; }
+log_function_output() {
+  local fn="$1"
+  shift || true
+  while IFS= read -r line; do
+    log "$line"
+  done < <("$fn" "$@")
+}
 
 STEP_RESULTS=()
 REBUILD_START=$(date +%s)
@@ -153,6 +168,7 @@ if [[ -n "$SCOPE" ]]; then
   log "Scope: ${SCOPE}"
   log "Targets: ${TOFU_TARGETS}"
 fi
+log "Override branch check: ${OVERRIDE_BRANCH_CHECK}"
 log ""
 
 # =====================================================================
@@ -356,7 +372,45 @@ if [[ "$PREREQ_FAIL" -gt 0 ]]; then
   die "FAILED: ${PREREQ_FAIL} prerequisite(s) not met. Fix and re-run."
 fi
 
-step_done 0 "Prerequisites verified"
+resolve_git_context
+if ! classify_scope_impact; then
+  log_function_output print_scope_classification_failure
+  die "Unsupported scope for branch-safety classification."
+fi
+
+detect_initial_deploy
+if [[ "${INITIAL_DEPLOY}" -eq 0 ]]; then
+  refresh_gitlab_prod_ref
+fi
+
+if ! check_branch_safety; then
+  log_function_output print_branch_safety_refusal
+  die "Branch safety refused this rebuild before any build or apply steps."
+fi
+
+if [[ "${INITIAL_DEPLOY}" -eq 0 ]]; then
+  resolve_last_known_prod_context
+  detect_config_yaml_divergence
+else
+  GITLAB_FETCH_ATTEMPTED=0
+  GITLAB_FETCH_SUCCEEDED=0
+  GITLAB_FETCH_DETAIL="not attempted (initial deploy)"
+  LAST_KNOWN_PROD_AVAILABLE=0
+  LAST_KNOWN_PROD_COMMIT=""
+  LAST_KNOWN_PROD_COMMIT_SHORT=""
+  LAST_KNOWN_PROD_DATE=""
+  LAST_KNOWN_PROD_DIFFERS_FROM_CURRENT=0
+  CONFIG_YAML_DIFF=0
+  log "No existing deployment detected - treating as initial deploy. Branch check skipped."
+fi
+
+log_function_output print_deploy_banner
+if [[ "${OVERRIDE_BRANCH_CHECK}" -eq 1 ]] && scope_requires_prod_branch; then
+  log_function_output print_last_known_prod_comparison
+fi
+log_function_output write_deploy_manifest
+
+step_done 0 "Prerequisites verified and deploy context recorded"
 
 # =====================================================================
 # Step 1: Configure node networking
@@ -538,6 +592,16 @@ else
   log "    WARNING: backup-now.sh not found — skipping pre-deploy backup"
 fi
 
+# Refresh state to detect resources deleted outside of tofu (e.g., HA resources
+# removed by Proxmox during VM recreation). Without this, tofu plans UPDATE on
+# nonexistent HA resources and fails. See: report-ha-resource-state-drift-retrospective.md
+log "    Refreshing tofu state (detect out-of-band changes)..."
+if [[ -n "$TOFU_TARGETS" ]]; then
+  "${SCRIPT_DIR}/tofu-wrapper.sh" refresh $TOFU_TARGETS -input=false 2>&1 | sed 's/^/    /' || true
+else
+  "${SCRIPT_DIR}/tofu-wrapper.sh" refresh -input=false 2>&1 | sed 's/^/    /' || true
+fi
+
 # HA double-apply: when VMs are recreated with new VMIDs, Proxmox removes the
 # HA resource. The first apply may fail on HA resource updates. A second apply
 # creates the fresh HA resources. This is a known provider limitation.
@@ -548,24 +612,153 @@ if [[ -n "$TOFU_TARGETS" ]]; then
 fi
 
 # Control-plane VMs (gitlab, cicd) use proxmox-vm-precious with prevent_destroy.
-# rebuild-cluster.sh is the authorized path for recreating them — override
-# prevent_destroy with -replace= for each control-plane VM in the target list.
-PRECIOUS_REPLACE=""
+# -replace= does NOT override prevent_destroy — tofu rejects the plan.
+# The authorized override: destroy via Proxmox API, remove from tofu state,
+# then apply creates the VM fresh. Only done when tofu plan shows pending
+# changes (image, CIDATA, or config). tofu plan is the authoritative source
+# of truth — it catches all forms of drift, not just image hash changes.
+STATE_OUTPUT=$("${SCRIPT_DIR}/tofu-wrapper.sh" state list 2>&1) || true
 for mod in $CONTROL_PLANE_MODULES; do
   if [[ "$TOFU_TARGETS" == *"$mod"* || -z "$TOFU_TARGETS" ]]; then
-    # Determine the inner resource address for -replace=
     mod_name=$(echo "$mod" | sed 's/module\.//')
-    RESOURCE="${mod}.module.${mod_name}.proxmox_virtual_environment_vm.vm"
-    # Only add -replace if the resource exists in state
-    if "${SCRIPT_DIR}/tofu-wrapper.sh" state list 2>/dev/null | grep -q "${RESOURCE}"; then
-      PRECIOUS_REPLACE="$PRECIOUS_REPLACE -replace=${RESOURCE}"
-      log "    Will replace control-plane VM: ${RESOURCE}"
+
+    # Check if this module has any pending changes via tofu plan
+    log "    ${mod_name}: checking for pending changes..."
+    plan_stderr="/tmp/rebuild-cp-plan-stderr-${mod_name}.txt"
+    rm -f "$plan_stderr"
+    set +e
+    "${SCRIPT_DIR}/tofu-wrapper.sh" plan \
+      -target="${mod}" \
+      -detailed-exitcode \
+      -no-color \
+      2>"$plan_stderr" >/dev/null
+    PLAN_EXIT=$?
+    set -e
+
+    if [[ "$PLAN_EXIT" -eq 0 ]]; then
+      log "    ${mod_name}: no pending changes — skipping"
+      rm -f "$plan_stderr"
+      continue
+    elif [[ "$PLAN_EXIT" -eq 2 ]]; then
+      # Changes detected, prevent_destroy did NOT fire.
+      # For gitlab/pbs: exit 2 means the change does NOT require VM destruction
+      # (if it did, prevent_destroy would have fired → exit 1). Safe for tofu apply.
+      # For cicd: exit 2 may include VM replacement (no prevent_destroy). Also safe
+      # for tofu apply since cicd has no prevent_destroy — tofu handles it directly.
+      log "    ${mod_name}: pending changes detected (deployable by tofu apply)"
+      rm -f "$plan_stderr"
+      continue
+    elif [[ "$PLAN_EXIT" -eq 1 ]]; then
+      # Check for prevent_destroy signal (gitlab, pbs image/CIDATA changes)
+      if grep -q "Instance cannot be destroyed" "$plan_stderr" 2>/dev/null; then
+        log "    ${mod_name}: pending changes BLOCKED by prevent_destroy — will destroy and recreate"
+        rm -f "$plan_stderr"
+      else
+        # Genuine infrastructure error — cannot determine state
+        log "    ERROR: tofu plan failed for ${mod_name}:"
+        tail -10 "$plan_stderr" >&2 || true
+        rm -f "$plan_stderr"
+        die "Cannot determine state for ${mod_name}. Fix the infrastructure error and retry."
+      fi
     fi
+
+    # Only reach here when prevent_destroy blocked a change (exit 1).
+    # Atomic per-VM rebuild: destroy → state rm → apply → restore.
+    # Each VM is fully rebuilt before touching the next one. If this VM's
+    # rebuild fails, previous VMs are already recovered and subsequent VMs
+    # are untouched. (#149)
+
+    # Find VMID and hosting node
+    VMID=$(yq -r ".vms.${mod_name}.vmid // \"\"" "$CONFIG")
+    if [[ -z "$VMID" || "$VMID" == "null" ]]; then
+      log "    WARNING: No VMID found for ${mod_name} in config.yaml — skipping"
+      continue
+    fi
+    HOSTING_IP=""
+    for node_ip in $(yq -r '.nodes[].mgmt_ip' "$CONFIG"); do
+      if ssh -n -o ConnectTimeout=5 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+          "root@${node_ip}" "qm status ${VMID}" >/dev/null 2>&1; then
+        HOSTING_IP="$node_ip"
+        break
+      fi
+    done
+
+    if [[ -n "$HOSTING_IP" ]]; then
+      log "    Destroying ${mod_name} (VMID ${VMID}) on ${HOSTING_IP} for recreation..."
+      ssh -n -o ConnectTimeout=10 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+        "root@${HOSTING_IP}" "ha-manager remove vm:${VMID} 2>/dev/null || true"
+      ssh -n -o ConnectTimeout=10 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+        "root@${HOSTING_IP}" "qm stop ${VMID} --skiplock 1 2>/dev/null || true"
+      # Poll for stopped status (gitlab may take 30+ seconds to shut down)
+      STOP_WAIT=0
+      while [[ $STOP_WAIT -lt 30 ]]; do
+        VM_STATUS=$(ssh -n -o ConnectTimeout=5 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+          "root@${HOSTING_IP}" "qm status ${VMID} 2>/dev/null | awk '{print \$2}'" || echo "unknown")
+        [[ "$VM_STATUS" == "stopped" ]] && break
+        sleep 2
+        STOP_WAIT=$((STOP_WAIT + 2))
+        ssh -n -o ConnectTimeout=10 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+          "root@${HOSTING_IP}" "qm stop ${VMID} --skiplock 1 2>/dev/null || true"
+      done
+      ssh -n -o ConnectTimeout=10 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+        "root@${HOSTING_IP}" "qm destroy ${VMID} --purge --skiplock 1 2>/dev/null || true"
+      # Clean stale zvols — explicit names only, fail on unexpected errors
+      for zvol_suffix in disk-0 disk-1 cloudinit; do
+        ZVOL="vmstore/data/vm-${VMID}-${zvol_suffix}"
+        ssh -n -o ConnectTimeout=10 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+          "root@${HOSTING_IP}" "zfs destroy -r ${ZVOL} 2>&1 | grep -v 'dataset does not exist' || true"
+      done
+    fi
+
+    # Remove all resources for this module from tofu state
+    REMOVED=0
+    RM_FAILURES=0
+    for res in $(echo "$STATE_OUTPUT" | grep "^${mod}\."); do
+      if "${SCRIPT_DIR}/tofu-wrapper.sh" state rm "$res" >/dev/null 2>&1; then
+        REMOVED=$((REMOVED + 1))
+      else
+        log "    ERROR: failed to remove ${res} from state"
+        RM_FAILURES=$((RM_FAILURES + 1))
+      fi
+    done
+    log "    Removed ${REMOVED} resources from tofu state for ${mod_name}"
+    if [[ $RM_FAILURES -gt 0 ]]; then
+      die "Failed to remove ${RM_FAILURES} resource(s) from state for ${mod_name}. Cannot proceed — tofu apply would hit prevent_destroy."
+    fi
+
+    # --- Atomic recreate: apply just this module ---
+    log "    Recreating ${mod_name}..."
+    "${SCRIPT_DIR}/tofu-wrapper.sh" apply -target="${mod}" -auto-approve -input=false
+    # Second apply for HA resource (may not exist on first apply)
+    "${SCRIPT_DIR}/tofu-wrapper.sh" apply -target="${mod}" -auto-approve -input=false
+
+    # Refresh SSH host key for the recreated VM
+    VM_IP=$(yq -r ".vms.${mod_name}.ip // \"\"" "$CONFIG")
+    if [[ -n "$VM_IP" && "$VM_IP" != "null" ]]; then
+      ssh-keygen -R "$VM_IP" 2>/dev/null || true
+    fi
+
+    # --- PBS post-install (if this is the PBS module) ---
+    if [[ "$mod_name" == "pbs" ]]; then
+      log "    Running PBS install and configure..."
+      "${SCRIPT_DIR}/install-pbs.sh"
+      "${SCRIPT_DIR}/configure-pbs.sh" --skip-backup-jobs
+    fi
+
+    # --- Restore precious state from PBS (if this VM has backup: true) ---
+    HAS_BACKUP=$(yq -r ".vms.${mod_name}.backup // false" "$CONFIG")
+    if [[ "$HAS_BACKUP" == "true" ]]; then
+      log "    Restoring vdb for ${mod_name} (VMID ${VMID}) from PBS..."
+      if ! "${SCRIPT_DIR}/restore-from-pbs.sh" --target "$VMID" --force; then
+        die "PBS restore failed for ${mod_name} (VMID ${VMID}). The VM was recreated but vdb is empty."
+      fi
+      log "    ${mod_name} restored from PBS"
+    fi
+
+    ATOMICALLY_RESTORED="${ATOMICALLY_RESTORED} ${mod_name}"
+    log "    ${mod_name}: atomic rebuild complete"
   fi
 done
-if [[ -n "$PRECIOUS_REPLACE" ]]; then
-  APPLY_ARGS="$PRECIOUS_REPLACE $APPLY_ARGS"
-fi
 
 "${SCRIPT_DIR}/tofu-wrapper.sh" apply $APPLY_ARGS
 echo ""
@@ -631,10 +824,12 @@ if step_in_scope pbs_install; then
     "${SCRIPT_DIR}/install-pbs.sh"
 
     # configure-pbs.sh is idempotent: sets up SSH keys, NFS mount, datastore,
-    # API token, Proxmox storage entry, and backup jobs.
+    # API token, Proxmox storage entry. Backup jobs are deferred to step 15.5
+    # (after restore verification) to prevent overwriting good backups with
+    # empty state if the restore fails.
     # Exit code 10 = stale NFS mount, need to recreate the PBS VM.
     set +e
-    "${SCRIPT_DIR}/configure-pbs.sh"
+    "${SCRIPT_DIR}/configure-pbs.sh" --skip-backup-jobs
     PBS_EXIT=$?
     set -e
     if [[ $PBS_EXIT -eq 10 ]]; then
@@ -681,7 +876,7 @@ if step_in_scope pbs_install; then
         fi
         sleep 5
       done
-      "${SCRIPT_DIR}/configure-pbs.sh"
+      "${SCRIPT_DIR}/configure-pbs.sh" --skip-backup-jobs
     elif [[ $PBS_EXIT -ne 0 ]]; then
       die "configure-pbs.sh failed (exit $PBS_EXIT)"
     fi
@@ -693,6 +888,31 @@ else
 fi
 
 # =====================================================================
+# Helper: check if a VM's vdb has content (beyond lost+found).
+# Used by Step 7.6 to detect VMs whose vdb was wiped by tofu recreate
+# vs VMs that were not recreated and have healthy data. A VM with
+# content on vdb should NOT be restored — the restore would overwrite
+# good state with an older backup.
+# See: report-cert-lost-to-pbs-restore.md for the incident this prevents.
+vdb_has_content() {
+  local vm_ip="$1"
+  local content_count
+  # Check the standard vdb mount paths. Infrastructure VMs mount vdb
+  # at /var/lib/<service>, application VMs at /var/lib/data. The
+  # specific path doesn't matter — any content beyond lost+found means
+  # the VM has state that shouldn't be overwritten.
+  content_count=$(ssh -n -o ConnectTimeout=10 \
+    -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+    "root@${vm_ip}" \
+    'for mp in /var/lib/gitlab /var/lib/vault /var/lib/data; do
+       [ -d "$mp" ] || continue
+       count=$(find "$mp" -mindepth 1 -not -name lost+found -maxdepth 1 2>/dev/null | wc -l)
+       if [ "$count" -gt 0 ]; then echo "$count"; exit 0; fi
+     done
+     echo 0' 2>/dev/null || echo "0")
+  [[ "$content_count" -gt 0 ]]
+}
+
 # Step 7.6: Restore precious state from PBS
 # =====================================================================
 step_start 7.6 "Restore precious state from PBS"
@@ -704,7 +924,21 @@ if [[ -n "$SCOPE" ]]; then
   for vm_key in $(yq -r '.vms | to_entries[] | select(.value.backup == true) | .key' "$CONFIG"); do
     VMID=$(yq -r ".vms.${vm_key}.vmid" "$CONFIG")
     if [[ "$TOFU_TARGETS" == *"module.${vm_key}"* || "$TOFU_TARGETS" == *"module.$(echo "$vm_key" | sed 's/_[^_]*$//')"* ]]; then
-      log "    Restoring vdb for ${vm_key} (VMID ${VMID})..."
+      # Skip if already restored by the atomic per-VM rebuild loop
+      if echo " ${ATOMICALLY_RESTORED} " | grep -q " ${vm_key} "; then
+        log "    ${vm_key}: already restored by atomic rebuild loop — skipping"
+        RESTORED_ANY=true
+        continue
+      fi
+      # Skip if vdb has content — VM was not recreated, data is healthy.
+      # Restoring would overwrite good state with an older backup.
+      VM_IP=$(yq -r ".vms.${vm_key}.ip" "$CONFIG")
+      if [[ -n "$VM_IP" && "$VM_IP" != "null" ]] && vdb_has_content "$VM_IP"; then
+        log "    ${vm_key}: vdb has content — skipping restore (VM was not recreated)"
+        RESTORED_ANY=true
+        continue
+      fi
+      log "    ${vm_key}: vdb is empty — restoring from PBS (VMID ${VMID})..."
       if ! "${SCRIPT_DIR}/restore-from-pbs.sh" --target "$VMID" --force; then
         log "    ERROR: restore failed for ${vm_key}"
         RESTORE_FAILURES=$((RESTORE_FAILURES + 1))
@@ -714,12 +948,25 @@ if [[ -n "$SCOPE" ]]; then
   done
   # Application VMs
   for app_key in $(yq -r '.applications // {} | to_entries[] | select(.value.enabled == true and .value.backup == true) | .key' "$APPS_CONFIG" 2>/dev/null); do
-    for env in prod dev; do
+    for env in $(yq -r ".applications.${app_key}.environments | keys | .[]" "$APPS_CONFIG" 2>/dev/null); do
       VMID=$(yq -r ".applications.${app_key}.environments.${env}.vmid // \"\"" "$APPS_CONFIG")
       [[ -z "$VMID" ]] && continue
       MOD_NAME="${app_key}_${env}"
       if [[ "$TOFU_TARGETS" == *"module.${MOD_NAME}"* ]]; then
-        log "    Restoring vdb for ${MOD_NAME} (VMID ${VMID})..."
+        # Skip if already restored by the atomic per-VM rebuild loop
+        if echo " ${ATOMICALLY_RESTORED} " | grep -q " ${MOD_NAME} "; then
+          log "    ${MOD_NAME}: already restored by atomic rebuild loop — skipping"
+          RESTORED_ANY=true
+          continue
+        fi
+        # Skip if vdb has content
+        APP_IP=$(yq -r ".applications.${app_key}.environments.${env}.ip // \"\"" "$APPS_CONFIG")
+        if [[ -n "$APP_IP" && "$APP_IP" != "null" ]] && vdb_has_content "$APP_IP"; then
+          log "    ${MOD_NAME}: vdb has content — skipping restore (VM was not recreated)"
+          RESTORED_ANY=true
+          continue
+        fi
+        log "    ${MOD_NAME}: vdb is empty — restoring from PBS (VMID ${VMID})..."
         if ! "${SCRIPT_DIR}/restore-from-pbs.sh" --target "$VMID" --force; then
           log "    ERROR: restore failed for ${MOD_NAME}"
           RESTORE_FAILURES=$((RESTORE_FAILURES + 1))
@@ -735,7 +982,52 @@ if [[ -n "$SCOPE" ]]; then
     log "    No scoped VMs need PBS restore"
   fi
 else
-  "${SCRIPT_DIR}/restore-from-pbs.sh" --force
+  # Full (unscoped) restore: check each precious-state VM individually.
+  # Only restore VMs whose vdb is empty (VM was recreated by tofu apply).
+  # VMs with content on vdb were NOT recreated and should not be overwritten.
+  RESTORE_FAILURES=0
+  for vm_key in $(yq -r '.vms | to_entries[] | select(.value.backup == true) | .key' "$CONFIG"); do
+    if echo " ${ATOMICALLY_RESTORED} " | grep -q " ${vm_key} "; then
+      log "    ${vm_key}: already restored by atomic rebuild loop — skipping"
+      continue
+    fi
+    VMID=$(yq -r ".vms.${vm_key}.vmid" "$CONFIG")
+    VM_IP=$(yq -r ".vms.${vm_key}.ip" "$CONFIG")
+    if [[ -n "$VM_IP" && "$VM_IP" != "null" ]] && vdb_has_content "$VM_IP"; then
+      log "    ${vm_key}: vdb has content — skipping restore (VM was not recreated)"
+      continue
+    fi
+    log "    ${vm_key}: vdb is empty — restoring from PBS (VMID ${VMID})..."
+    if ! "${SCRIPT_DIR}/restore-from-pbs.sh" --target "$VMID" --force; then
+      log "    ERROR: restore failed for ${vm_key}"
+      RESTORE_FAILURES=$((RESTORE_FAILURES + 1))
+    fi
+  done
+  # Application VMs
+  for app_key in $(yq -r '.applications // {} | to_entries[] | select(.value.enabled == true and .value.backup == true) | .key' "$APPS_CONFIG" 2>/dev/null); do
+    for env in prod dev; do
+      VMID=$(yq -r ".applications.${app_key}.environments.${env}.vmid // \"\"" "$APPS_CONFIG")
+      [[ -z "$VMID" ]] && continue
+      MOD_NAME="${app_key}_${env}"
+      if echo " ${ATOMICALLY_RESTORED} " | grep -q " ${MOD_NAME} "; then
+        log "    ${MOD_NAME}: already restored by atomic rebuild loop — skipping"
+        continue
+      fi
+      APP_IP=$(yq -r ".applications.${app_key}.environments.${env}.ip // \"\"" "$APPS_CONFIG")
+      if [[ -n "$APP_IP" && "$APP_IP" != "null" ]] && vdb_has_content "$APP_IP"; then
+        log "    ${MOD_NAME}: vdb has content — skipping restore (VM was not recreated)"
+        continue
+      fi
+      log "    ${MOD_NAME}: vdb is empty — restoring from PBS (VMID ${VMID})..."
+      if ! "${SCRIPT_DIR}/restore-from-pbs.sh" --target "$VMID" --force; then
+        log "    ERROR: restore failed for ${MOD_NAME}"
+        RESTORE_FAILURES=$((RESTORE_FAILURES + 1))
+      fi
+    done
+  done
+  if [[ $RESTORE_FAILURES -gt 0 ]]; then
+    die "PBS restore failed for ${RESTORE_FAILURES} VM(s). Check output above."
+  fi
 fi
 step_done 7.6 "PBS restore complete"
 
@@ -758,61 +1050,132 @@ fi
 # =====================================================================
 step_start 9 "Wait for certificates"
 
-# Helper: SSH to a VM
+# Helper: SSH to a VM (used by staging override and cert checks below)
 cert_ssh() {
   ssh -n -o ConnectTimeout=5 -o StrictHostKeyChecking=no \
     -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR "root@$1" "$2" 2>/dev/null
 }
+
+# When --override-branch-check is active (DR/development rebuilds),
+# override prod/shared VM ACME URLs to LE staging. This prevents
+# exhausting LE production rate limits during repeated rebuilds.
+# The override is runtime-only (written to /run/secrets/) and does
+# NOT persist across reboots or affect subsequent pipeline deploys.
+if [[ "$OVERRIDE_BRANCH_CHECK" -eq 1 ]]; then
+  LE_STAGING_URL="https://acme-staging-v02.api.letsencrypt.org/directory"
+  log ""
+  log "    ╔══════════════════════════════════════════════════════════════╗"
+  log "    ║  NOTE: Using Let's Encrypt STAGING certificates             ║"
+  log "    ║  (--override-branch-check active)                           ║"
+  log "    ║                                                             ║"
+  log "    ║  Staging certs are functionally valid but not browser-       ║"
+  log "    ║  trusted. After stabilizing, promote to prod and rebuild     ║"
+  log "    ║  from the prod branch to get production certificates.        ║"
+  log "    ╚══════════════════════════════════════════════════════════════╝"
+  log ""
+
+  # Override ACME URL on prod/shared VMs that use LE production
+  for VM_KEY in gitlab gatus; do
+    VM_IP=$(yq -r ".vms.${VM_KEY}.ip // \"\"" "$CONFIG")
+    [[ -z "$VM_IP" || "$VM_IP" == "null" ]] && continue
+    CURRENT_URL=$(cert_ssh "$VM_IP" "cat /run/secrets/certbot/acme-server-url 2>/dev/null" || true)
+    if [[ "$CURRENT_URL" == *"acme-v02.api.letsencrypt.org"* ]]; then
+      cert_ssh "$VM_IP" "echo '${LE_STAGING_URL}' > /run/secrets/certbot/acme-server-url" || true
+      log "    ${VM_KEY}: ACME URL overridden to LE staging"
+    fi
+  done
+  for VM_KEY in $(yq -r '.vms | to_entries[] | select(.key | test("_prod$")) | .key' "$CONFIG" 2>/dev/null); do
+    VM_IP=$(yq -r ".vms.${VM_KEY}.ip" "$CONFIG")
+    CURRENT_URL=$(cert_ssh "$VM_IP" "cat /run/secrets/certbot/acme-server-url 2>/dev/null" || true)
+    if [[ "$CURRENT_URL" == *"acme-v02.api.letsencrypt.org"* ]]; then
+      cert_ssh "$VM_IP" "echo '${LE_STAGING_URL}' > /run/secrets/certbot/acme-server-url" || true
+      log "    ${VM_KEY}: ACME URL overridden to LE staging"
+    fi
+  done
+fi
+
+# cert_ssh helper moved above the staging override block (defined earlier in Step 9)
+
+ACME_DEV_IP=$(yq -r '.vms.acme_dev.ip // ""' "$CONFIG" 2>/dev/null || true)
+if [[ -n "$ACME_DEV_IP" && "$ACME_DEV_IP" != "null" ]]; then
+  ACME_DEV_URL="https://acme:14000/acme/acme/directory"
+  ACME_DEV_CA="${REPO_DIR}/framework/step-ca/root-ca.crt"
+  ACME_DEV_TIMEOUT=300
+  ACME_DEV_INTERVAL=10
+  elapsed=0
+  while true; do
+    if curl --silent --show-error --max-time 5 \
+      --cacert "$ACME_DEV_CA" \
+      --resolve "acme:14000:${ACME_DEV_IP}" \
+      "$ACME_DEV_URL" >/dev/null 2>&1; then
+      log "    acme-dev is serving ACME"
+      break
+    fi
+
+    if (( elapsed >= ACME_DEV_TIMEOUT )); then
+      log "    FATAL: Timed out waiting for acme-dev ACME endpoint (${ACME_DEV_TIMEOUT}s)"
+      DIAG=$(cert_ssh "$ACME_DEV_IP" "
+        echo 'step-ca:'; systemctl is-active step-ca 2>/dev/null || true
+        echo '---'
+        journalctl -u step-ca --no-pager -n 10 2>/dev/null || true
+        echo '---'
+        echo 'step-ca-dns-forwarder:'; systemctl is-active step-ca-dns-forwarder 2>/dev/null || true
+        journalctl -u step-ca-dns-forwarder --no-pager -n 5 2>/dev/null || true
+      " || echo "  VM unreachable")
+      echo "$DIAG" | while IFS= read -r line; do log "      $line"; done
+      die "Dev ACME endpoint failed to become healthy"
+    fi
+
+    if (( elapsed > 0 && elapsed % 60 == 0 )); then
+      log "    Still waiting for acme-dev ACME endpoint... (${elapsed}s / ${ACME_DEV_TIMEOUT}s)"
+    fi
+
+    sleep "$ACME_DEV_INTERVAL"
+    elapsed=$(( elapsed + ACME_DEV_INTERVAL ))
+  done
+fi
 
 # Pre-flight: clean up empty cert files on all VMs that use ACME.
 # Certbot can leave empty PEM files after an ACME server outage. The
 # ExecCondition then skips re-acquisition because the directory exists.
 # Deleting the empty live/ directory forces certbot to re-run.
 log "    Checking for stale/empty cert files..."
+
+# Helper: check a single VM for empty cert files
+check_empty_certs() {
+  local vm_ip="$1" vm_label="$2"
+  local empty_cert
+  empty_cert=$(cert_ssh "$vm_ip" '
+    for d in /etc/letsencrypt/live/*/; do
+      [ -d "$d" ] || continue
+      cert="${d}fullchain.pem"
+      [ -e "$cert" ] && [ ! -s "$cert" ] && echo "$d"
+    done; true
+  ' || true)
+  if [[ -n "$empty_cert" ]]; then
+    log "    ${vm_label}: found empty cert files — cleaning up and restarting certbot"
+    cert_ssh "$vm_ip" 'rm -rf /etc/letsencrypt/live /etc/letsencrypt/archive /etc/letsencrypt/renewal; systemctl restart certbot-initial 2>/dev/null || true'
+  fi
+}
+
+# Per-environment VMs and application VMs
 for ENV in prod dev; do
   for VM_KEY in $(yq -r ".vms | to_entries[] | select(.key | test(\"_${ENV}$\")) | .key" "$CONFIG" 2>/dev/null); do
     VM_IP=$(yq -r ".vms.${VM_KEY}.ip" "$CONFIG")
-    EMPTY_CERT=$(cert_ssh "$VM_IP" '
-      for d in /etc/letsencrypt/live/*/; do
-        cert="${d}fullchain.pem"
-        [ -e "$cert" ] && [ ! -s "$cert" ] && echo "$d"
-      done; true
-    ' || true)
-    if [[ -n "$EMPTY_CERT" ]]; then
-      log "    ${VM_KEY}: found empty cert files — cleaning up and restarting certbot"
-      cert_ssh "$VM_IP" 'rm -rf /etc/letsencrypt/live /etc/letsencrypt/archive /etc/letsencrypt/renewal; systemctl restart certbot-initial 2>/dev/null || true'
-    fi
+    check_empty_certs "$VM_IP" "$VM_KEY"
   done
-  # Also check shared VMs (gitlab, gatus)
-  for VM_KEY in gitlab gatus; do
-    VM_IP=$(yq -r ".vms.${VM_KEY}.ip // \"\"" "$CONFIG")
-    [[ -z "$VM_IP" || "$VM_IP" == "null" ]] && continue
-    EMPTY_CERT=$(cert_ssh "$VM_IP" '
-      for d in /etc/letsencrypt/live/*/; do
-        cert="${d}fullchain.pem"
-        [ -e "$cert" ] && [ ! -s "$cert" ] && echo "$d"
-      done; true
-    ' || true)
-    if [[ -n "$EMPTY_CERT" ]]; then
-      log "    ${VM_KEY}: found empty cert files — cleaning up and restarting certbot"
-      cert_ssh "$VM_IP" 'rm -rf /etc/letsencrypt/live /etc/letsencrypt/archive /etc/letsencrypt/renewal; systemctl restart certbot-initial 2>/dev/null || true'
-    fi
-  done
-  # Application VMs
   for APP_KEY in $(yq -r '.applications // {} | to_entries[] | select(.value.enabled == true) | .key' "$APPS_CONFIG" 2>/dev/null); do
     VM_IP=$(yq -r ".applications.${APP_KEY}.environments.${ENV}.ip // \"\"" "$APPS_CONFIG")
     [[ -z "$VM_IP" || "$VM_IP" == "null" ]] && continue
-    EMPTY_CERT=$(cert_ssh "$VM_IP" '
-      for d in /etc/letsencrypt/live/*/; do
-        cert="${d}fullchain.pem"
-        [ -e "$cert" ] && [ ! -s "$cert" ] && echo "$d"
-      done; true
-    ' || true)
-    if [[ -n "$EMPTY_CERT" ]]; then
-      log "    ${APP_KEY}_${ENV}: found empty cert files — cleaning up and restarting certbot"
-      cert_ssh "$VM_IP" 'rm -rf /etc/letsencrypt/live /etc/letsencrypt/archive /etc/letsencrypt/renewal; systemctl restart certbot-initial 2>/dev/null || true'
-    fi
+    check_empty_certs "$VM_IP" "${APP_KEY}_${ENV}"
   done
+done
+
+# Shared VMs (gitlab, gatus) — checked ONCE, not per-ENV
+for VM_KEY in gitlab gatus; do
+  VM_IP=$(yq -r ".vms.${VM_KEY}.ip // \"\"" "$CONFIG")
+  [[ -z "$VM_IP" || "$VM_IP" == "null" ]] && continue
+  check_empty_certs "$VM_IP" "$VM_KEY"
 done
 
 # Pre-flight 2: detect wrong-domain certs from PBS restore.
@@ -825,10 +1188,18 @@ log "    Checking for wrong-domain certs (expected domain: ${DOMAIN})..."
 check_cert_domain() {
   local vm_ip="$1" expected_fqdn="$2" vm_label="$3"
   local cert_dirs
+  # Only report cert directories that contain a non-empty fullchain.pem.
+  # An empty or missing cert is not "stale" — it's just not yet issued.
   cert_dirs=$(cert_ssh "$vm_ip" \
-    'for d in /etc/letsencrypt/live/*/; do basename "$d"; done 2>/dev/null' || true)
+    'for d in /etc/letsencrypt/live/*/; do
+       [ -d "$d" ] || continue
+       name=$(basename "$d")
+       [ "$name" = "README" ] && continue
+       cert="${d}fullchain.pem"
+       [ -f "$cert" ] && [ -s "$cert" ] && echo "$name"
+     done 2>/dev/null' || true)
   for dir in $cert_dirs; do
-    [[ "$dir" == "README" || "$dir" == "*" ]] && continue
+    [[ -z "$dir" || "$dir" == "*" ]] && continue
     if [[ "$dir" != "$expected_fqdn" ]]; then
       log "    ${vm_label}: stale cert for '${dir}' (expected: ${expected_fqdn})"
       log "    Cleaning stale certs — certbot will re-acquire for the correct domain."
@@ -838,20 +1209,13 @@ check_cert_domain() {
   done
 }
 
+# Per-environment VMs and application VMs
 for ENV in prod dev; do
-  # Per-environment VMs: vault_prod → vault.prod.<domain>
   for VM_KEY in $(yq -r ".vms | to_entries[] | select(.key | test(\"_${ENV}$\")) | .key" "$CONFIG" 2>/dev/null); do
     VM_IP=$(yq -r ".vms.${VM_KEY}.ip" "$CONFIG")
     # Extract hostname: vault_prod → vault, dns1_dev → dns1
     HOSTNAME=$(echo "$VM_KEY" | sed "s/_${ENV}$//")
     EXPECTED_FQDN="${HOSTNAME}.${ENV}.${DOMAIN}"
-    check_cert_domain "$VM_IP" "$EXPECTED_FQDN" "$VM_KEY"
-  done
-  # Shared VMs (gitlab, gatus) — use prod domain
-  for VM_KEY in gitlab gatus; do
-    VM_IP=$(yq -r ".vms.${VM_KEY}.ip // \"\"" "$CONFIG")
-    [[ -z "$VM_IP" || "$VM_IP" == "null" ]] && continue
-    EXPECTED_FQDN="${VM_KEY}.prod.${DOMAIN}"
     check_cert_domain "$VM_IP" "$EXPECTED_FQDN" "$VM_KEY"
   done
   # Application VMs
@@ -861,6 +1225,14 @@ for ENV in prod dev; do
     EXPECTED_FQDN="${APP_KEY}.${ENV}.${DOMAIN}"
     check_cert_domain "$VM_IP" "$EXPECTED_FQDN" "${APP_KEY}_${ENV}"
   done
+done
+
+# Shared VMs (gitlab, gatus) — use prod domain, checked ONCE (not per-ENV)
+for VM_KEY in gitlab gatus; do
+  VM_IP=$(yq -r ".vms.${VM_KEY}.ip // \"\"" "$CONFIG")
+  [[ -z "$VM_IP" || "$VM_IP" == "null" ]] && continue
+  EXPECTED_FQDN="${VM_KEY}.prod.${DOMAIN}"
+  check_cert_domain "$VM_IP" "$EXPECTED_FQDN" "$VM_KEY"
 done
 
 CERT_TIMEOUT=600
@@ -1001,44 +1373,57 @@ fi
 # =====================================================================
 if step_in_scope push; then
 step_start 14.5 "Push repository to GitLab"
-GITLAB_IP=$(yq -r '.vms.gitlab.ip' "$CONFIG")
-PROJECT_NAME=$(yq -r '.cicd.project_name' "$CONFIG")
-
-# Ensure gitlab remote exists and points to the right place (SSH transport)
-if git -C "$REPO_DIR" remote get-url gitlab &>/dev/null; then
-  git -C "$REPO_DIR" remote set-url gitlab "gitlab@${GITLAB_IP}:root/${PROJECT_NAME}.git"
+if should_skip_gitlab_handoff; then
+  step_skip 14.5 "Override branch check active for prod/shared impact - skipping GitLab push intentionally"
 else
-  git -C "$REPO_DIR" remote add gitlab "gitlab@${GITLAB_IP}:root/${PROJECT_NAME}.git"
-fi
+  GITLAB_IP=$(yq -r '.vms.gitlab.ip' "$CONFIG")
+  PROJECT_NAME=$(yq -r '.cicd.project_name' "$CONFIG")
 
-# Clear stale host key for GitLab
-ssh-keygen -R "$GITLAB_IP" 2>/dev/null || true
-ssh-keyscan -H "$GITLAB_IP" >> ~/.ssh/known_hosts 2>/dev/null
+  # Ensure gitlab remote exists and points to the right place (SSH transport)
+  if git -C "$REPO_DIR" remote get-url gitlab &>/dev/null; then
+    git -C "$REPO_DIR" remote set-url gitlab "gitlab@${GITLAB_IP}:root/${PROJECT_NAME}.git"
+  else
+    git -C "$REPO_DIR" remote add gitlab "gitlab@${GITLAB_IP}:root/${PROJECT_NAME}.git"
+  fi
 
-# Push the current branch
-CURRENT_BRANCH=$(git -C "$REPO_DIR" branch --show-current)
-git -C "$REPO_DIR" push gitlab "$CURRENT_BRANCH" --force
-log "    Pushed branch '${CURRENT_BRANCH}' to GitLab"
+  # Clear stale host key for GitLab
+  ssh-keygen -R "$GITLAB_IP" 2>/dev/null || true
+  ssh-keyscan -H "$GITLAB_IP" >> ~/.ssh/known_hosts 2>/dev/null
 
-# Trigger a fresh pipeline via API. The push above may say "up-to-date"
-# if configure-gitlab.sh already pushed the same commit. We need a pipeline
-# that runs AFTER the runner is registered and all config is done.
-PUSH_PW=$(sops -d --extract '["gitlab_root_password"]' "${REPO_DIR}/site/sops/secrets.yaml" 2>/dev/null || true)
-if [[ -n "$PUSH_PW" && "$PUSH_PW" != "null" ]]; then
-  PUSH_TOKEN=$(curl -sk -X POST "https://${GITLAB_IP}/oauth/token" \
-    -d "grant_type=password&username=root&password=${PUSH_PW}" 2>/dev/null | jq -r '.access_token // empty')
-  if [[ -n "$PUSH_TOKEN" ]]; then
-    TRIGGER_RESULT=$(curl -sk -X POST "https://${GITLAB_IP}/api/v4/projects/1/pipeline" \
-      -H "Authorization: Bearer ${PUSH_TOKEN}" \
-      -d "ref=${CURRENT_BRANCH}" 2>/dev/null | jq -r '.id // empty')
-    if [[ -n "$TRIGGER_RESULT" ]]; then
-      log "    Triggered pipeline #${TRIGGER_RESULT} on ${CURRENT_BRANCH}"
+  # Push the current branch (handle detached HEAD for initial deploy)
+  CURRENT_BRANCH=$(git -C "$REPO_DIR" branch --show-current)
+  if [[ -z "$CURRENT_BRANCH" ]]; then
+    # Detached HEAD — push to dev as the initial branch
+    git -C "$REPO_DIR" push gitlab HEAD:dev --force
+    CURRENT_BRANCH="dev"
+    log "    Detached HEAD — pushed to GitLab as 'dev'"
+  else
+    git -C "$REPO_DIR" push gitlab "$CURRENT_BRANCH" --force
+    log "    Pushed branch '${CURRENT_BRANCH}' to GitLab"
+  fi
+
+  # Trigger a fresh pipeline via API. The push above may say "up-to-date"
+  # if configure-gitlab.sh already pushed the same commit. We need a pipeline
+  # that runs AFTER the runner is registered and all config is done.
+  PUSH_PW=$(sops -d --extract '["gitlab_root_password"]' "${REPO_DIR}/site/sops/secrets.yaml" 2>/dev/null || true)
+  if [[ -n "$PUSH_PW" && "$PUSH_PW" != "null" ]]; then
+    PUSH_TOKEN=$(curl -sk -X POST "https://${GITLAB_IP}/oauth/token" \
+      -d "grant_type=password&username=root&password=${PUSH_PW}" 2>/dev/null | jq -r '.access_token // empty')
+    if [[ -n "$PUSH_TOKEN" ]]; then
+      TRIGGER_RESULT=$(curl -sk -X POST "https://${GITLAB_IP}/api/v4/projects/1/pipeline" \
+        -H "Authorization: Bearer ${PUSH_TOKEN}" \
+        -d "ref=${CURRENT_BRANCH}" 2>/dev/null | jq -r '.id // empty')
+      if [[ -n "$TRIGGER_RESULT" ]]; then
+        log "    Triggered pipeline #${TRIGGER_RESULT} on ${CURRENT_BRANCH}"
+      else
+        log "    WARNING: Could not trigger pipeline via API"
+      fi
     else
-      log "    WARNING: Could not trigger pipeline via API"
+      log "    WARNING: Could not authenticate to GitLab API for pipeline trigger"
     fi
   fi
+  step_done 14.5 "Repository pushed to GitLab"
 fi
-step_done 14.5 "Repository pushed to GitLab"
 else
   step_skip 14.5 "Push to GitLab (not in scope)"
 fi
@@ -1134,98 +1519,107 @@ if [[ $VALIDATE_PASS -eq 0 ]]; then
 fi
 step_done 16 "Validation passed"
 
+if should_skip_gitlab_handoff && ! step_in_scope pipeline; then
+  log_function_output print_post_dr_reconciliation_instructions
+fi
+
 # =====================================================================
 # Step 17: Wait for pipeline
 # =====================================================================
 if step_in_scope pipeline; then
 step_start 17 "Wait for pipeline"
-GITLAB_IP=$(yq -r '.vms.gitlab.ip' "$CONFIG")
-GITLAB_PW=$(sops -d --extract '["gitlab_root_password"]' "${REPO_DIR}/site/sops/secrets.yaml" 2>/dev/null || true)
-if [[ -n "$GITLAB_PW" && "$GITLAB_PW" != "null" ]]; then
-  PIPELINE_TOKEN=$(curl -sk -X POST "https://${GITLAB_IP}/oauth/token" \
-    -d "grant_type=password&username=root&password=${GITLAB_PW}" 2>/dev/null | jq -r '.access_token // empty')
-  if [[ -n "$PIPELINE_TOKEN" ]]; then
-    # Find the most recent pipeline on the current branch (dev)
-    CURRENT_BRANCH=$(git -C "$REPO_DIR" branch --show-current)
-    PIPELINE_ID=$(curl -sk "https://${GITLAB_IP}/api/v4/projects/1/pipelines?ref=${CURRENT_BRANCH}&per_page=1" \
-      -H "Authorization: Bearer ${PIPELINE_TOKEN}" 2>/dev/null | jq -r '.[0].id // empty')
-    if [[ -n "$PIPELINE_ID" ]]; then
-      log "    Waiting for pipeline #${PIPELINE_ID}..."
-      PIPELINE_WAIT=0
-      LAST_JOBS_HASH=""
-      STALE_COUNT=0
-      while true; do
-        PIPELINE_JSON=$(curl -sk "https://${GITLAB_IP}/api/v4/projects/1/pipelines/${PIPELINE_ID}" \
-          -H "Authorization: Bearer ${PIPELINE_TOKEN}" 2>/dev/null)
-        PIPELINE_STATUS=$(echo "$PIPELINE_JSON" | jq -r '.status')
+if should_skip_gitlab_handoff; then
+  step_skip 17 "Override branch check active for prod/shared impact - skipping pipeline wait intentionally"
+  log_function_output print_post_dr_reconciliation_instructions
+else
+  GITLAB_IP=$(yq -r '.vms.gitlab.ip' "$CONFIG")
+  GITLAB_PW=$(sops -d --extract '["gitlab_root_password"]' "${REPO_DIR}/site/sops/secrets.yaml" 2>/dev/null || true)
+  if [[ -n "$GITLAB_PW" && "$GITLAB_PW" != "null" ]]; then
+    PIPELINE_TOKEN=$(curl -sk -X POST "https://${GITLAB_IP}/oauth/token" \
+      -d "grant_type=password&username=root&password=${GITLAB_PW}" 2>/dev/null | jq -r '.access_token // empty')
+    if [[ -n "$PIPELINE_TOKEN" ]]; then
+      # Find the most recent pipeline on the current branch (dev)
+      CURRENT_BRANCH=$(git -C "$REPO_DIR" branch --show-current)
+      PIPELINE_ID=$(curl -sk "https://${GITLAB_IP}/api/v4/projects/1/pipelines?ref=${CURRENT_BRANCH}&per_page=1" \
+        -H "Authorization: Bearer ${PIPELINE_TOKEN}" 2>/dev/null | jq -r '.[0].id // empty')
+      if [[ -n "$PIPELINE_ID" ]]; then
+        log "    Waiting for pipeline #${PIPELINE_ID}..."
+        PIPELINE_WAIT=0
+        LAST_JOBS_HASH=""
+        STALE_COUNT=0
+        while true; do
+          PIPELINE_JSON=$(curl -sk "https://${GITLAB_IP}/api/v4/projects/1/pipelines/${PIPELINE_ID}" \
+            -H "Authorization: Bearer ${PIPELINE_TOKEN}" 2>/dev/null)
+          PIPELINE_STATUS=$(echo "$PIPELINE_JSON" | jq -r '.status')
 
-        case "$PIPELINE_STATUS" in
-          success)
-            log "    Pipeline #${PIPELINE_ID}: success"
-            break ;;
-          failed)
-            log "    Pipeline #${PIPELINE_ID}: FAILED"
-            curl -sk "https://${GITLAB_IP}/api/v4/projects/1/pipelines/${PIPELINE_ID}/jobs" \
-              -H "Authorization: Bearer ${PIPELINE_TOKEN}" 2>/dev/null | \
-              jq -r '.[] | select(.status == "failed") | "      FAILED: \(.name) (\(.stage))"' 2>/dev/null
-            die "Pipeline failed. Check GitLab UI for details." ;;
-          canceled|skipped)
-            log "    Pipeline #${PIPELINE_ID}: ${PIPELINE_STATUS}"
-            log "    WARNING: Pipeline did not complete normally"
-            break ;;
-        esac
+          case "$PIPELINE_STATUS" in
+            success)
+              log "    Pipeline #${PIPELINE_ID}: success"
+              break ;;
+            failed)
+              log "    Pipeline #${PIPELINE_ID}: FAILED"
+              curl -sk "https://${GITLAB_IP}/api/v4/projects/1/pipelines/${PIPELINE_ID}/jobs" \
+                -H "Authorization: Bearer ${PIPELINE_TOKEN}" 2>/dev/null | \
+                jq -r '.[] | select(.status == "failed") | "      FAILED: \(.name) (\(.stage))"' 2>/dev/null
+              die "Pipeline failed. Check GitLab UI for details." ;;
+            canceled|skipped)
+              log "    Pipeline #${PIPELINE_ID}: ${PIPELINE_STATUS}"
+              log "    WARNING: Pipeline did not complete normally"
+              break ;;
+          esac
 
-        # Detect truly stuck pipelines — distinguish from runner-busy queue.
-        # A pipeline is stuck only if it's in a non-terminal state AND no job
-        # is running or pending (everything is "created" = no runner picked it up).
-        JOBS_JSON=$(curl -sk "https://${GITLAB_IP}/api/v4/projects/1/pipelines/${PIPELINE_ID}/jobs" \
-          -H "Authorization: Bearer ${PIPELINE_TOKEN}" 2>/dev/null)
-        JOBS_HASH=$(echo "$JOBS_JSON" | jq -r '[.[] | "\(.name):\(.status)"] | sort | join(",")' 2>/dev/null)
-        ACTIVE_JOBS=$(echo "$JOBS_JSON" | jq -r '[.[] | select(.status == "running" or .status == "pending")] | length' 2>/dev/null)
+          # Detect truly stuck pipelines — distinguish from runner-busy queue.
+          # A pipeline is stuck only if it's in a non-terminal state AND no job
+          # is running or pending (everything is "created" = no runner picked it up).
+          JOBS_JSON=$(curl -sk "https://${GITLAB_IP}/api/v4/projects/1/pipelines/${PIPELINE_ID}/jobs" \
+            -H "Authorization: Bearer ${PIPELINE_TOKEN}" 2>/dev/null)
+          JOBS_HASH=$(echo "$JOBS_JSON" | jq -r '[.[] | "\(.name):\(.status)"] | sort | join(",")' 2>/dev/null)
+          ACTIVE_JOBS=$(echo "$JOBS_JSON" | jq -r '[.[] | select(.status == "running" or .status == "pending")] | length' 2>/dev/null)
 
-        if [[ "$JOBS_HASH" == "$LAST_JOBS_HASH" ]]; then
-          STALE_COUNT=$((STALE_COUNT + 1))
-        else
-          STALE_COUNT=0
-          LAST_JOBS_HASH="$JOBS_HASH"
-        fi
+          if [[ "$JOBS_HASH" == "$LAST_JOBS_HASH" ]]; then
+            STALE_COUNT=$((STALE_COUNT + 1))
+          else
+            STALE_COUNT=0
+            LAST_JOBS_HASH="$JOBS_HASH"
+          fi
 
-        # Stuck = no progress for 3 minutes AND no jobs running or pending
-        if [[ $STALE_COUNT -ge 12 && "${ACTIVE_JOBS:-0}" -eq 0 ]]; then
-          log "    Pipeline #${PIPELINE_ID} appears stuck (no progress, no active jobs)"
-          log "    Status: ${PIPELINE_STATUS}"
-          log "    Jobs: ${JOBS_HASH}"
-          die "Pipeline hung. Check runner status and GitLab UI."
-        fi
+          # Stuck = no progress for 3 minutes AND no jobs running or pending
+          if [[ $STALE_COUNT -ge 12 && "${ACTIVE_JOBS:-0}" -eq 0 ]]; then
+            log "    Pipeline #${PIPELINE_ID} appears stuck (no progress, no active jobs)"
+            log "    Status: ${PIPELINE_STATUS}"
+            log "    Jobs: ${JOBS_HASH}"
+            die "Pipeline hung. Check runner status and GitLab UI."
+          fi
 
-        # Hard timeout: 20 minutes (image builds can take 5-10 minutes)
-        PIPELINE_WAIT=$((PIPELINE_WAIT + 1))
-        if [[ $PIPELINE_WAIT -ge 80 ]]; then
-          log "    Pipeline #${PIPELINE_ID} still running after 20 minutes (status: ${PIPELINE_STATUS})"
-          die "Pipeline timed out. Check GitLab UI."
-        fi
+          # Hard timeout: 20 minutes (image builds can take 5-10 minutes)
+          PIPELINE_WAIT=$((PIPELINE_WAIT + 1))
+          if [[ $PIPELINE_WAIT -ge 80 ]]; then
+            log "    Pipeline #${PIPELINE_ID} still running after 20 minutes (status: ${PIPELINE_STATUS})"
+            die "Pipeline timed out. Check GitLab UI."
+          fi
 
-        if (( PIPELINE_WAIT % 4 == 0 && PIPELINE_WAIT > 0 )); then
-          # Show which jobs are running/pending
-          RUNNING_JOBS=$(echo "$JOBS_JSON" | jq -r '[.[] | select(.status == "running") | .name] | join(", ")' 2>/dev/null)
-          PENDING_JOBS=$(echo "$JOBS_JSON" | jq -r '[.[] | select(.status == "pending") | .name] | join(", ")' 2>/dev/null)
-          PROGRESS_MSG="($((PIPELINE_WAIT * 15))s / $((80 * 15))s)"
-          [[ -n "$RUNNING_JOBS" ]] && PROGRESS_MSG+=" running: ${RUNNING_JOBS}"
-          [[ -n "$PENDING_JOBS" ]] && PROGRESS_MSG+=" pending: ${PENDING_JOBS}"
-          log "    Waiting for pipeline #${PIPELINE_ID}... ${PROGRESS_MSG}"
-        fi
-        sleep 15
-      done
+          if (( PIPELINE_WAIT % 4 == 0 && PIPELINE_WAIT > 0 )); then
+            # Show which jobs are running/pending
+            RUNNING_JOBS=$(echo "$JOBS_JSON" | jq -r '[.[] | select(.status == "running") | .name] | join(", ")' 2>/dev/null)
+            PENDING_JOBS=$(echo "$JOBS_JSON" | jq -r '[.[] | select(.status == "pending") | .name] | join(", ")' 2>/dev/null)
+            PROGRESS_MSG="($((PIPELINE_WAIT * 15))s / $((80 * 15))s)"
+            [[ -n "$RUNNING_JOBS" ]] && PROGRESS_MSG+=" running: ${RUNNING_JOBS}"
+            [[ -n "$PENDING_JOBS" ]] && PROGRESS_MSG+=" pending: ${PENDING_JOBS}"
+            log "    Waiting for pipeline #${PIPELINE_ID}... ${PROGRESS_MSG}"
+          fi
+          sleep 15
+        done
+      else
+        log "    No pipelines found — skipping"
+      fi
     else
-      log "    No pipelines found — skipping"
+      log "    WARNING: Could not authenticate to GitLab API — skipping pipeline check"
     fi
   else
-    log "    WARNING: Could not authenticate to GitLab API — skipping pipeline check"
+    log "    WARNING: No GitLab password in SOPS — skipping pipeline check"
   fi
-else
-  log "    WARNING: No GitLab password in SOPS — skipping pipeline check"
+  step_done 17 "Pipeline verified"
 fi
-step_done 17 "Pipeline verified"
 else
   step_skip 17 "Pipeline wait (not in scope)"
 fi

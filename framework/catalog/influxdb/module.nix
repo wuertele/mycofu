@@ -234,6 +234,7 @@ in
     # --- vdb mount at /var/lib/influxdb2 ---
     # Mount by label (not /dev/sdb) — device letter assignment is not stable
     # across VM recreations with virtio-scsi.
+    mycofu.vdbMountPoint = "/var/lib/influxdb2";
     fileSystems."/var/lib/influxdb2" = {
       device = "/dev/disk/by-label/influxdb-data";
       fsType = "ext4";
@@ -348,11 +349,13 @@ in
         "var-lib-influxdb2.mount"
         "influxdb-tls-config.service"
         "influxdb-place-setup.service"
+        "vdb-ready.target"
       ];
       requires = [
         "var-lib-influxdb2.mount"
         "influxdb-tls-config.service"
         "influxdb-place-setup.service"
+        "vdb-ready.target"
       ];
       wants = [ "network-online.target" ];
       wantedBy = [ "multi-user.target" ];

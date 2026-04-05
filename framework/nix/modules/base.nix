@@ -14,6 +14,10 @@
 { config, pkgs, lib, ... }:
 
 {
+  imports = [
+    ./wait-for-vdb.nix
+  ];
+
   # ── Boot ────────────────────────────────────────────────────────────
   # Initrd: only virtio drivers + iso9660 (for CIDATA CD-ROM)
   boot.initrd.availableKernelModules = [
@@ -105,7 +109,7 @@
   # Standard paths for bootstrap-tier secrets:
   #   /run/secrets/certbot/pdns-api-key    — PowerDNS HTTP API key (DNS VMs, certbot hooks)
   #   /run/secrets/certbot/acme-server-url — ACME directory URL (all VMs with certbot)
-  #   /run/secrets/certbot/acme-ca-cert    — ACME CA cert, optional (dev/Pebble only)
+  #   /run/secrets/extra-ca-cert           — Extra root CA cert, optional (dev ACME only)
   #   /run/secrets/vault-unseal-key        — Vault unseal key (Vault VMs, Step 5)
   #
   # All files written to /run/secrets/ should have permissions 0400, owner root:root.
@@ -132,6 +136,59 @@
       ExecStart = "${pkgs.python3}/bin/python3 ${./nocloud-init.py}";
     };
     path = with pkgs; [ util-linux inetutils ];
+  };
+
+  # ── Optional extra CA bundle augmentation ─────────────────────────
+  # Dev VMs receive /run/secrets/extra-ca-cert via CIDATA. When present,
+  # build a writable combined trust bundle and repoint the standard system
+  # CA path at it. Prod VMs never receive the file, so this unit is a no-op.
+  systemd.services.extra-ca-bundle = {
+    description = "Augment the system CA bundle with an extra CIDATA CA";
+    wantedBy = [ "multi-user.target" ];
+    after = [ "nocloud-init.service" ];
+    requires = [ "nocloud-init.service" ];
+    before = [ "certbot-initial.service" "certbot-renew.service" "vault-agent.service" ];
+    serviceConfig = {
+      Type = "oneshot";
+      RemainAfterExit = true;
+      ExecCondition = pkgs.writeShellScript "extra-ca-bundle-needed" ''
+        test -s /run/secrets/extra-ca-cert
+      '';
+      ExecStart = pkgs.writeShellScript "extra-ca-bundle-build" ''
+        set -euo pipefail
+        export PATH=${lib.makeBinPath [ pkgs.coreutils pkgs.openssl ]}:$PATH
+
+        EXTRA_CA=/run/secrets/extra-ca-cert
+        BUNDLE_DIR=/run/ca-bundle
+        SYSTEM_BUNDLE=$BUNDLE_DIR/system-ca-certificates.crt
+        COMBINED_BUNDLE=$BUNDLE_DIR/ca-certificates.crt
+        TARGET_LINK=/etc/ssl/certs/ca-certificates.crt
+
+        mkdir -p "$BUNDLE_DIR"
+
+        # Capture the pristine NixOS bundle once per boot so reruns do not
+        # append the extra CA repeatedly to an already-managed file.
+        if [ ! -s "$SYSTEM_BUNDLE" ]; then
+          ORIGINAL_BUNDLE=$(readlink -f "$TARGET_LINK")
+          if [ "$ORIGINAL_BUNDLE" = "$COMBINED_BUNDLE" ]; then
+            echo "ERROR: combined bundle is active but original bundle cache is missing" >&2
+            exit 1
+          fi
+          cp "$ORIGINAL_BUNDLE" "$SYSTEM_BUNDLE"
+          chmod 0444 "$SYSTEM_BUNDLE"
+        fi
+
+        openssl x509 -in "$EXTRA_CA" -noout >/dev/null
+
+        cat "$SYSTEM_BUNDLE" "$EXTRA_CA" > "$COMBINED_BUNDLE"
+        chmod 0444 "$COMBINED_BUNDLE"
+
+        rm -f "$TARGET_LINK"
+        ln -s "$COMBINED_BUNDLE" "$TARGET_LINK"
+
+        echo "System CA bundle augmented with /run/secrets/extra-ca-cert"
+      '';
+    };
   };
 
   # Emit a clear wall message when nocloud-init fails so operators

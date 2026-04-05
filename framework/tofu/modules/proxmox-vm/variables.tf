@@ -63,6 +63,12 @@ variable "vdb_size_gb" {
   default     = 0
 }
 
+variable "vdb_restore_expected" {
+  description = "Whether vdb contains precious state that requires PBS restore. When true, CIDATA includes a flag that blocks application services until vdb has real content."
+  type        = bool
+  default     = false
+}
+
 variable "ssh_pubkey" {
   description = "Framework SSH public key from SOPS (CI runner access)"
   type        = string
@@ -99,7 +105,7 @@ variable "storage_pool" {
 variable "all_node_names" {
   description = "List of all Proxmox node names in the cluster (for snippet replication to support HA)"
   type        = list(string)
-  default     = []  # If empty, falls back to [target_node] (single-node, no HA snippet replication)
+  default     = [] # If empty, falls back to [target_node] (single-node, no HA snippet replication)
 }
 
 variable "domain" {
@@ -143,6 +149,30 @@ variable "mgmt_nic" {
     mac_address = string
   })
   default = null
+}
+
+variable "tailscale_auth_key" {
+  description = "Tailscale pre-auth key. When non-empty, delivered via CIDATA to /run/secrets/tailscale/auth-key"
+  type        = string
+  default     = ""
+}
+
+variable "extra_ca_cert" {
+  description = "Optional PEM-encoded extra CA certificate delivered via CIDATA to /run/secrets/extra-ca-cert"
+  type        = string
+  default     = ""
+}
+
+variable "vault_approle_role_id" {
+  description = "Vault AppRole role_id for vault-agent authentication (from SOPS)"
+  type        = string
+  default     = ""
+}
+
+variable "vault_approle_secret_id" {
+  description = "Vault AppRole secret_id for vault-agent authentication (from SOPS)"
+  type        = string
+  default     = ""
 }
 
 variable "mounts" {

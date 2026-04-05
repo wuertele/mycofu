@@ -7,20 +7,35 @@
 #   safe-apply.sh dev --dry-run   # show categorization without applying
 #
 # The script:
-#   1. Runs tofu plan (all modules)
-#   2. Exports plan to JSON
-#   3. Categorizes every change by environment and protection status
-#   4. Warns if control-plane modules have drift (skips them)
+#   1. Checks for control-plane image drift (informational warning)
+#   2. Runs tofu plan (excluding control-plane modules)
+#   3. Exports plan to JSON
+#   4. Categorizes every change by environment
 #   5. Applies only data-plane modules belonging to the specified environment
 #
 # Module categorization (by naming convention):
 #   Control-plane:  module.gitlab, module.cicd, module.pbs → workstation only
-#   Dev data-plane: module.*_dev, module.pebble            → deploy:dev
+#   Dev data-plane: module.*_dev, module.acme_dev          → deploy:dev
 #   Prod data-plane: module.*_prod, module.gatus           → deploy:prod
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# --- Control-plane module list ---
+# These modules are excluded from plan and apply. Two reasons:
+#   gitlab, pbs: prevent_destroy = true (tofu plan crashes if they have changes)
+#   cicd: self-hosting constraint (pipeline cannot redeploy the runner it runs on)
+# IMPORTANT: if you add a control-plane module here, also update
+# CONTROL_PLANE_MODULES in framework/scripts/validate.sh (R7.2 check).
+CONTROL_PLANE_MODULES="module.gitlab module.cicd module.pbs"
+
+# Build -exclude flags from the module list
+# Requires OpenTofu >= 1.9. The cicd image includes opentofu from nixpkgs.
+EXCLUDES=""
+for mod in $CONTROL_PLANE_MODULES; do
+  EXCLUDES="$EXCLUDES -exclude=$mod"
+done
 
 # --- Parse arguments ---
 ENV="${1:-}"
@@ -45,9 +60,50 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# --- Run tofu plan ---
-echo "Planning all modules..."
-"${SCRIPT_DIR}/tofu-wrapper.sh" plan -out="$PLAN_OUT" -no-color
+# --- Check for control-plane image drift (informational, non-fatal) ---
+# Uses check-control-plane-drift.sh (nix-eval based, no build artifacts needed).
+# Only detects image drift, not CIDATA drift. CIDATA drift is caught by R7.2
+# in validate.sh after deploy. This warning helps the operator see image drift
+# early, but does not block the data-plane deploy.
+echo ""
+echo "=== Checking control-plane image drift ==="
+set +e
+"${SCRIPT_DIR}/check-control-plane-drift.sh" 2>&1
+CP_DRIFT_EXIT=$?
+set -e
+
+if [[ $CP_DRIFT_EXIT -eq 1 ]]; then
+  echo ""
+  echo "=================================================="
+  echo "WARNING: Control-plane image drift detected"
+  echo "=================================================="
+  echo ""
+  echo "  The data-plane deploy will proceed, but control-plane VMs"
+  echo "  need manual deployment from the workstation."
+  echo ""
+  echo "  After this deploy completes:"
+  echo "    1. Run: framework/scripts/backup-now.sh"
+  echo "       Verify: exits 0, check backup sizes in output"
+  echo "    2. Run: git checkout prod && framework/scripts/rebuild-cluster.sh --scope control-plane"
+  echo "       Verify: exits 0, validate.sh passes"
+  echo "    3. If cicd was rebuilt: framework/scripts/register-runner.sh"
+  echo "       Verify: runner shows online in GitLab"
+  echo ""
+  echo "  Use --override-branch-check only for true disaster recovery."
+  echo ""
+  echo "  Proceeding with data-plane deploy only."
+  echo "=================================================="
+  echo ""
+elif [[ $CP_DRIFT_EXIT -eq 2 ]]; then
+  echo "  (drift check could not run — proceeding with deploy)"
+  echo ""
+fi
+
+# --- Run tofu plan (excluding control-plane modules) ---
+# Control-plane modules are excluded so prevent_destroy doesn't crash the plan.
+# Drift on those modules is detected separately (above warning + R7.2 in validate.sh).
+echo "Planning data-plane modules (excluding control-plane)..."
+"${SCRIPT_DIR}/tofu-wrapper.sh" plan ${EXCLUDES} -out="$PLAN_OUT" -no-color
 echo "Plan complete, exporting to JSON..."
 
 # --- Export plan to JSON ---
@@ -75,19 +131,19 @@ with open('$PLAN_JSON', 'w') as f:
 "
 
 # --- Categorize changes ---
+# With -exclude on plan, control-plane modules never appear in the plan JSON.
+# Categorization only handles data-plane modules.
 set +e
 DEPLOY_ENV="$ENV" python3 -c "
 import sys, json, os, re
 
 env = os.environ['DEPLOY_ENV']
-PROTECTED = {'module.gitlab', 'module.cicd', 'module.pbs'}
-DEV_EXTRAS = {'module.pebble'}
+DEV_EXTRAS = {'module.acme_dev'}
 PROD_EXTRAS = {'module.gatus'}
 
 with open('$PLAN_JSON') as f:
     plan = json.load(f)
 
-control_plane_drift = []
 deployable = []
 skipped = []
 
@@ -98,26 +154,16 @@ for rc in plan.get('resource_changes', []):
 
     addr = rc.get('address', '')
     mod = '.'.join(addr.split('.')[:2]) if '.' in addr else addr
-    # Strip count/for_each index (e.g., module.grafana_dev[0] → module.grafana_dev)
+    # Strip count/for_each index (e.g., module.grafana_dev[0] -> module.grafana_dev)
     mod = re.sub(r'\[.*\]$', '', mod)
 
-    if mod in PROTECTED:
-        if 'delete' in actions or 'create' in actions:
-            control_plane_drift.append(f'  {addr}: {actions}')
-        skipped.append(mod)
-    elif mod.endswith(f'_{env}') or mod in (DEV_EXTRAS if env == 'dev' else PROD_EXTRAS):
+    if mod.endswith(f'_{env}') or mod in (DEV_EXTRAS if env == 'dev' else PROD_EXTRAS):
         deployable.append(mod)
     else:
-        if mod not in (DEV_EXTRAS | PROD_EXTRAS | PROTECTED):
-            other_env = 'prod' if env == 'dev' else 'dev'
-            if not mod.endswith(f'_{other_env}'):
-                print(f'WARNING: module {mod} does not match any environment — skipping', file=sys.stderr)
+        other_env = 'prod' if env == 'dev' else 'dev'
+        if not mod.endswith(f'_{other_env}') and mod not in (DEV_EXTRAS | PROD_EXTRAS):
+            print(f'WARNING: module {mod} does not match any environment -- skipping', file=sys.stderr)
         skipped.append(mod)
-
-if control_plane_drift:
-    print('CONTROL_PLANE_DRIFT')
-    for d in control_plane_drift:
-        print(d)
 
 # Output unique deployable modules (one per line)
 for mod in sorted(set(deployable)):
@@ -134,30 +180,10 @@ if [[ $CATEGORIZE_EXIT -ne 0 ]]; then
   exit 1
 fi
 
-# --- Warn about control-plane drift (but don't block) ---
-# The pipeline can't deploy control-plane VMs (it runs on them).
-# The guard:control-plane CI job blocks prod MRs until drift is resolved.
-if grep -q "^CONTROL_PLANE_DRIFT$" "$CATEGORIZE_OUT"; then
-  echo ""
-  echo "=================================================="
-  echo "WARNING: Control-plane VMs need manual deployment"
-  echo "=================================================="
-  echo ""
-  grep -v "^CONTROL_PLANE_DRIFT$" "$CATEGORIZE_OUT" | grep -v "^module\." | grep -v "^WARNING:" | grep -v "^$" || true
-  echo ""
-  echo "Deploy from the workstation when ready:"
-  echo "  framework/scripts/rebuild-cluster.sh --scope control-plane"
-  echo ""
-  echo "DO NOT run 'tofu apply' directly on control-plane modules."
-  echo ""
-fi
-
 # Extract -target flags from categorize output (skip non-module lines)
 TARGETS=""
 while IFS= read -r line; do
   [[ "$line" == WARNING:* ]] && echo "$line" >&2 && continue
-  [[ "$line" == CONTROL_PLANE_DRIFT ]] && continue
-  [[ "$line" == "  "* ]] && continue  # drift detail lines (indented)
   [[ -z "$line" ]] && continue
   TARGETS="$TARGETS -target=$line"
 done < "$CATEGORIZE_OUT"
@@ -181,8 +207,32 @@ fi
 # The first apply creates VMs but can't create HA resources (VM must exist first).
 # The second apply picks up the missing HA resources. Always run both — the first
 # apply succeeds (VMs created) without error, so checking exit code is insufficient.
+# Refresh state before apply to detect resources deleted outside of tofu.
+# The bpg provider's HA resource Read function doesn't detect missing
+# resources during plan-time refresh, but explicit refresh does. Without
+# this, a missing HA resource causes "Error updating HA resource: no such
+# resource" because tofu plans UPDATE instead of CREATE.
+# See: report-ha-resource-state-drift-retrospective.md
+echo ""
+echo "=== Refreshing state (detect out-of-band changes) ==="
+"${SCRIPT_DIR}/tofu-wrapper.sh" refresh ${TARGETS}
+
+# Note: -target and -exclude are mutually exclusive in OpenTofu.
+# The plan uses -exclude (to avoid prevent_destroy). The apply uses -target
+# (from the categorizer, which already excludes control-plane modules).
+# -exclude on apply is not needed — -target already constrains the scope.
 "${SCRIPT_DIR}/tofu-wrapper.sh" apply ${TARGETS} -auto-approve
 
 echo ""
 echo "=== Second apply (HA resources) ==="
+"${SCRIPT_DIR}/tofu-wrapper.sh" apply ${TARGETS} -auto-approve
+
+echo ""
+echo "=== Third apply (HA resource attribute convergence) ==="
+# The bpg Proxmox provider's CREATE for proxmox_virtual_environment_haresource
+# only sends the 'state' field. Optional attributes (comment, max_relocate,
+# max_restart) are not included in the CREATE payload and require a subsequent
+# UPDATE pass to be set. This third apply is that UPDATE pass.
+# It is a no-op when no VMs were recreated (no HA resources were newly created).
+# See: https://github.com/bpg/terraform-provider-proxmox (HA resource CREATE behavior)
 "${SCRIPT_DIR}/tofu-wrapper.sh" apply ${TARGETS} -auto-approve

@@ -87,7 +87,7 @@ if [[ "$DOMAIN" != "example.com" ]]; then
 fi
 
 # Generate unique MAC addresses for all infrastructure VMs
-for vm in dns1_prod dns2_prod vault_prod dns1_dev dns2_dev vault_dev pebble pbs gitlab cicd testapp_dev testapp_prod gatus; do
+for vm in dns1_prod dns2_prod vault_prod dns1_dev dns2_dev vault_dev acme_dev pbs gitlab cicd testapp_dev testapp_prod gatus; do
   MAC=$(generate_mac)
   yq -i ".vms.${vm}.mac = \"${MAC}\"" "${SITE_DIR}/config.yaml"
 done
@@ -184,7 +184,7 @@ echo ""
 echo "Generating site/nix/hosts/ (infrastructure roles)..."
 
 # role:module pairs (module name when different from role name)
-for entry in dns:dns vault:vault gitlab:gitlab cicd:gitlab-runner pebble:pebble gatus:gatus testapp:testapp; do
+for entry in dns:dns vault:vault gitlab:gitlab cicd:gitlab-runner acme-dev:step-ca gatus:gatus testapp:testapp; do
   role="${entry%%:*}"
   module="${entry##*:}"
   host_file="${SITE_DIR}/nix/hosts/${role}.nix"

@@ -900,14 +900,15 @@ if [[ "$REGRESSION" -eq 1 || "$REGRESSION_SAFE" -eq 1 ]]; then
     if [[ "$REGRESSION_SAFE" -eq 1 && ${#ENVS[@]} -eq 1 ]]; then
       local env="${ENVS[0]}"
       if [[ "$env" == "dev" ]]; then
-        targets=(-target=module.dns_dev -target=module.vault_dev -target=module.pebble -target=module.testapp_dev -target=module.influxdb_dev -target=module.grafana_dev)
+        targets=(-target=module.dns_dev -target=module.vault_dev -target=module.acme_dev -target=module.testapp_dev -target=module.influxdb_dev -target=module.grafana_dev)
       elif [[ "$env" == "prod" ]]; then
         targets=(-target=module.dns_prod -target=module.vault_prod -target=module.gatus -target=module.testapp_prod -target=module.influxdb_prod -target=module.grafana_prod)
       fi
     fi
 
     # Ensure tofu is initialized (test stage may start with clean .terraform/)
-    if [[ ! -d "${REPO_DIR}/site/tofu/.terraform" ]]; then
+    # tofu-wrapper.sh does cd to framework/tofu/root/ — that's where .terraform/ lives
+    if [[ ! -d "${REPO_DIR}/framework/tofu/root/.terraform" ]]; then
       "$wrapper" init -input=false >/dev/null 2>&1 || {
         echo "  tofu init failed — skipping" >&2
         return 2
@@ -950,7 +951,11 @@ if [[ "$REGRESSION" -eq 1 || "$REGRESSION_SAFE" -eq 1 ]]; then
     fi
   }
 
+  # Capture function output and exit code. set +e prevents set -e from killing
+  # the subshell (and the outer script) when the function returns non-zero.
+  set +e
   R7_RESULT=$(r7_1_tofu_drift 2>&1; echo "EXIT:$?")
+  set -e
   R7_EXIT=$(echo "$R7_RESULT" | sed -n 's/^EXIT:\([0-9]*\)$/\1/p' | tail -1)
   R7_MSG=$(echo "$R7_RESULT" | grep -v '^EXIT:')
   if [[ "$R7_EXIT" -eq 2 ]]; then
@@ -963,6 +968,185 @@ if [[ "$REGRESSION" -eq 1 || "$REGRESSION_SAFE" -eq 1 ]]; then
   else
     echo "[FAIL] R7.1: tofu plan shows only known drift"
     [[ -n "$R7_MSG" ]] && echo "$R7_MSG"
+    FAIL=$((FAIL + 1))
+  fi
+
+  # R7.2 — Control-plane VMs have no pending changes [cluster]
+  #
+  # The pipeline cannot deploy control-plane VMs (gitlab has prevent_destroy,
+  # cicd is the runner itself, pbs is workstation-managed). If any of them
+  # have image or CIDATA drift, the operator must deploy from the workstation.
+  #
+  # This check detects BOTH image drift AND CIDATA drift (unlike the pre-plan
+  # warning in safe-apply.sh which only catches image drift via nix-eval).
+  #
+  # IMPORTANT: if you add a control-plane module here, also update
+  # CONTROL_PLANE_MODULES in framework/scripts/safe-apply.sh.
+  CONTROL_PLANE_MODULES="module.gitlab module.cicd module.pbs"
+
+  r7_2_control_plane_drift() {
+    local wrapper="${SCRIPT_DIR}/tofu-wrapper.sh"
+    local tfvars="${REPO_DIR}/site/tofu/image-versions.auto.tfvars"
+    local stderr_file="/tmp/r7_2_plan_stderr.txt"
+
+    # Check for image-versions.auto.tfvars (needed for accurate image comparison)
+    if [[ ! -f "$tfvars" ]] || grep -q "Placeholder" "$tfvars" 2>/dev/null; then
+      if [[ "${CI:-}" == "true" ]]; then
+        # R7.2 only runs in --regression-safe mode, which is called from test:dev/test:prod
+        # — always after build:images. If tfvars is missing here, either the build artifact
+        # expired (pipeline took >1h) or something is genuinely broken. FAIL, not SKIP.
+        echo "  image-versions.auto.tfvars not available in test stage." >&2
+        echo "  The build:images artifact may have expired (>1h pipeline)." >&2
+        echo "  Retry the pipeline, or check build:images job output." >&2
+        return 1  # FAIL — should never happen in normal operation
+      else
+        echo "  image-versions.auto.tfvars not found or contains placeholders." >&2
+        echo "  Run framework/scripts/build-all-images.sh before validating." >&2
+        return 1  # FAIL on workstation
+      fi
+    fi
+
+    if [[ ! -f "$wrapper" ]]; then
+      echo "  tofu-wrapper.sh not found" >&2
+      return 2
+    fi
+
+    # Check for SOPS age key availability (same check as R7.1)
+    if [[ -z "${SOPS_AGE_KEY_FILE:-}" ]] \
+       && [[ ! -f "${REPO_DIR}/operator.age.key" ]] \
+       && [[ ! -f "${XDG_CONFIG_HOME:-${HOME}/.config}/sops/age/keys.txt" ]]; then
+      echo "  No SOPS age key available — skipping" >&2
+      return 2
+    fi
+
+    # Ensure tofu is initialized (reuse .terraform/ if R7.1 already initialized)
+    if [[ ! -d "${REPO_DIR}/framework/tofu/root/.terraform" ]]; then
+      "$wrapper" init -input=false >/dev/null 2>&1 || {
+        echo "  tofu init failed — cannot run R7.2" >&2
+        return 2
+      }
+    fi
+
+    # Build -target flags from the control-plane module list
+    local targets=()
+    for mod in $CONTROL_PLANE_MODULES; do
+      targets+=("-target=$mod")
+    done
+
+    # Run tofu plan against control-plane modules only
+    local plan_output plan_exit
+    rm -f "$stderr_file"
+    # Use || to capture exit code without set +e/set -e, which would
+    # re-enable set -e in the subshell and kill it on function return.
+    local plan_exit=0
+    plan_output=$("$wrapper" plan \
+      -detailed-exitcode -no-color \
+      "${targets[@]}" \
+      2>"$stderr_file") || plan_exit=$?
+
+    if [[ "$plan_exit" -eq 0 ]]; then
+      echo "  Control-plane: no pending changes" >&2
+      rm -f "$stderr_file"
+      return 0  # PASS
+
+    elif [[ "$plan_exit" -eq 2 ]]; then
+      # Deployable changes detected (exit 2 = prevent_destroy did NOT fire).
+      # This catches: cicd image changes (no prevent_destroy), PBS config changes.
+      local affected
+      affected=$(echo "$plan_output" | grep -oE 'module\.(gitlab|cicd|pbs)' | sort -u)
+      echo "  Control-plane drift detected:" >&2
+      echo "$plan_output" | grep -E '^\s+#.*will be|^\s+#.*must be' | head -10 >&2
+      echo "" >&2
+      echo "  Remediation:" >&2
+      if echo "$affected" | grep -q 'module\.gitlab'; then
+        echo "    gitlab changed:" >&2
+        echo "      1. framework/scripts/backup-now.sh   (verify: exits 0)" >&2
+        echo "      2. framework/scripts/rebuild-cluster.sh --scope control-plane" >&2
+        echo "         (verify: exits 0, validate.sh passes)" >&2
+      fi
+      if echo "$affected" | grep -q 'module\.cicd'; then
+        echo "    cicd changed:" >&2
+        echo "      1. framework/scripts/backup-now.sh   (verify: exits 0)" >&2
+        echo "      2. framework/scripts/rebuild-cluster.sh --scope vm=cicd" >&2
+        echo "         (verify: exits 0)" >&2
+        echo "      3. framework/scripts/register-runner.sh" >&2
+        echo "         (verify: runner shows online in GitLab)" >&2
+      fi
+      if echo "$affected" | grep -q 'module\.pbs'; then
+        echo "    pbs config changed (in-place, no VM recreation):" >&2
+        echo "      framework/scripts/tofu-wrapper.sh apply -target=module.pbs -auto-approve" >&2
+      fi
+      if [[ -z "$affected" ]]; then
+        echo "    Could not identify specific modules. General remediation:" >&2
+        echo "      1. framework/scripts/backup-now.sh   (verify: exits 0)" >&2
+        echo "      2. framework/scripts/rebuild-cluster.sh --scope control-plane" >&2
+        echo "         (verify: exits 0, validate.sh passes)" >&2
+      fi
+      rm -f "$stderr_file"
+      return 1  # FAIL
+
+    elif [[ "$plan_exit" -eq 1 ]]; then
+      # Check stderr for prevent_destroy signal
+      if grep -q "Instance cannot be destroyed" "$stderr_file" 2>/dev/null; then
+        # prevent_destroy fired: image or CIDATA changed on a protected VM.
+        # This is the most critical drift case — the pipeline skipped these VMs.
+        local affected
+        affected=$(cat "$stderr_file" | grep -oE 'module\.(gitlab|pbs)' | sort -u || true)
+        echo "  Control-plane drift BLOCKED by prevent_destroy:" >&2
+        echo "  Image or CIDATA changed on: ${affected:-unknown}" >&2
+        grep "Instance cannot be destroyed" "$stderr_file" >&2
+        echo "" >&2
+        echo "  Remediation:" >&2
+        echo "    1. framework/scripts/backup-now.sh   (verify: exits 0)" >&2
+        echo "    2. framework/scripts/rebuild-cluster.sh --scope control-plane" >&2
+        echo "       (verify: exits 0, validate.sh passes)" >&2
+        echo "    3. If cicd was also rebuilt: framework/scripts/register-runner.sh" >&2
+        echo "       (verify: runner shows online in GitLab)" >&2
+        # Show any additional errors beyond prevent_destroy
+        local other_errors
+        other_errors=$(grep -v "Instance cannot be destroyed" "$stderr_file" \
+          | grep -iE "error|failed" || true)
+        if [[ -n "$other_errors" ]]; then
+          echo "" >&2
+          echo "  Additional errors in plan output:" >&2
+          echo "$other_errors" | head -5 >&2
+        fi
+        rm -f "$stderr_file"
+        return 1  # FAIL
+      else
+        # Genuine infrastructure error (backend issue, provider error, etc.)
+        # Cannot determine whether control-plane drift exists. The safe answer
+        # is FAIL — an unknowable state must not silently pass.
+        echo "  tofu plan failed (exit 1) — infrastructure error." >&2
+        echo "  Cannot determine control-plane state. Investigate before proceeding." >&2
+        tail -10 "$stderr_file" >&2 2>/dev/null || true
+        rm -f "$stderr_file"
+        return 1  # FAIL — cannot determine state, assume unsafe
+      fi
+    else
+      echo "  tofu plan exited with unexpected code: ${plan_exit}" >&2
+      rm -f "$stderr_file"
+      return 2  # SKIP
+    fi
+  }
+
+  # Capture function output and exit code. set +e prevents set -e from killing
+  # the subshell (and the outer script) when the function returns non-zero.
+  set +e
+  R7_2_RESULT=$(r7_2_control_plane_drift 2>&1; echo "EXIT:$?")
+  set -e
+  R7_2_EXIT=$(echo "$R7_2_RESULT" | sed -n 's/^EXIT:\([0-9]*\)$/\1/p' | tail -1)
+  R7_2_MSG=$(echo "$R7_2_RESULT" | grep -v '^EXIT:')
+  if [[ "$R7_2_EXIT" -eq 2 ]]; then
+    check_skip "R7.2: control-plane VMs have no pending changes" \
+      "${R7_2_MSG}"
+  elif [[ "$R7_2_EXIT" -eq 0 ]]; then
+    echo "[PASS] R7.2: control-plane VMs have no pending changes"
+    [[ -n "$R7_2_MSG" ]] && echo "$R7_2_MSG"
+    PASS=$((PASS + 1))
+  else
+    echo "[FAIL] R7.2: control-plane VMs have no pending changes"
+    [[ -n "$R7_2_MSG" ]] && echo "$R7_2_MSG"
     FAIL=$((FAIL + 1))
   fi
 

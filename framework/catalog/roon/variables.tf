@@ -86,6 +86,12 @@ variable "domain" {
   default     = ""
 }
 
+variable "extra_ca_cert" {
+  description = "PEM content of the extra CA root delivered via CIDATA (empty = no extra CA)"
+  type        = string
+  default     = ""
+}
+
 variable "ip_address" {
   description = "Static IPv4 address for the primary NIC"
   type        = string
@@ -126,4 +132,10 @@ variable "mounts" {
     options = optional(string, "")
   }))
   default = []
+}
+
+variable "vdb_restore_expected" {
+  description = "Whether vdb requires PBS restore"
+  type        = bool
+  default     = false
 }

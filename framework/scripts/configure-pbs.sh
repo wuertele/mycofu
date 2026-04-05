@@ -6,9 +6,10 @@
 # retention policy, API token, Proxmox storage, and backup jobs.
 #
 # Usage:
-#   framework/scripts/configure-pbs.sh              # Full configuration
-#   framework/scripts/configure-pbs.sh --verify     # Check configuration only
-#   framework/scripts/configure-pbs.sh --dry-run    # Show what would be done
+#   framework/scripts/configure-pbs.sh                       # Full configuration
+#   framework/scripts/configure-pbs.sh --verify              # Check configuration only
+#   framework/scripts/configure-pbs.sh --dry-run             # Show what would be done
+#   framework/scripts/configure-pbs.sh --skip-backup-jobs    # Skip backup job creation
 #
 # Idempotent: safe to re-run. Skips steps that are already completed.
 #
@@ -37,19 +38,22 @@ SECRETS_FILE="${REPO_DIR}/site/sops/secrets.yaml"
 
 # --- Parse arguments ---
 MODE="configure"  # configure | verify | dry-run
+SKIP_BACKUP_JOBS=false
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --verify)  MODE="verify"; shift ;;
     --dry-run) MODE="dry-run"; shift ;;
+    --skip-backup-jobs) SKIP_BACKUP_JOBS=true; shift ;;
     --help|-h)
-      echo "Usage: $(basename "$0") [--verify|--dry-run|--help]"
+      echo "Usage: $(basename "$0") [--verify|--dry-run|--skip-backup-jobs|--help]"
       echo ""
       echo "Configure Proxmox Backup Server after ISO installation."
       echo ""
       echo "Options:"
-      echo "  --verify   Check configuration without making changes"
-      echo "  --dry-run  Show what would be done without executing"
-      echo "  --help     Show this help message"
+      echo "  --verify            Check configuration without making changes"
+      echo "  --dry-run           Show what would be done without executing"
+      echo "  --skip-backup-jobs  Skip backup job creation (used by rebuild-cluster.sh)"
+      echo "  --help              Show this help message"
       exit 0
       ;;
     *) echo "Unknown argument: $1" >&2; exit 1 ;;
@@ -599,6 +603,9 @@ fi
 
 # --- H. Create backup jobs ---
 echo ""
+if [[ "$SKIP_BACKUP_JOBS" == "true" ]]; then
+  echo "--- H. Skipping backup job creation (--skip-backup-jobs) ---"
+else
 echo "--- H. Creating backup jobs for precious-state VMs ---"
 
 # VMs with precious state: Vault (Raft storage) and GitLab (repos, CI/CD data)
@@ -644,6 +651,7 @@ else
     echo "  Backup job created"
   fi
 fi
+fi  # end --skip-backup-jobs check
 
 # --- I. Commit SOPS changes ---
 echo ""

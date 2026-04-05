@@ -6,8 +6,8 @@ resource "proxmox_virtual_environment_vm" "vm" {
   node_name = var.target_node
 
   # Force-stop before destroy so we never hang waiting for a non-responsive agent
-  stop_on_destroy    = true
-  timeout_stop_vm    = 60
+  stop_on_destroy     = true
+  timeout_stop_vm     = 60
   timeout_shutdown_vm = 60
 
   agent {

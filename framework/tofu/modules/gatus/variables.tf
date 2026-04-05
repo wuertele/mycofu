@@ -73,6 +73,12 @@ variable "domain" {
   default     = ""
 }
 
+variable "extra_ca_cert" {
+  description = "PEM content of the extra CA root delivered via CIDATA (empty = no extra CA)"
+  type        = string
+  default     = ""
+}
+
 variable "ip_address" {
   description = "Static IPv4 address for the primary NIC"
   type        = string
@@ -95,3 +101,17 @@ variable "search_domain" {
   default     = ""
 }
 
+
+variable "vault_approle_role_id" {
+  description = "Vault AppRole role_id for vault-agent"
+  type        = string
+  sensitive   = true
+  default     = ""
+}
+
+variable "vault_approle_secret_id" {
+  description = "Vault AppRole secret_id for vault-agent"
+  type        = string
+  sensitive   = true
+  default     = ""
+}

@@ -24,8 +24,8 @@ the new result. Move the old result to the History table.
 
 | ID | Name | Last Result | Last Run | Commit | Est. Time |
 |----|------|-------------|----------|--------|-----------|
-| DRT-001 | Warm Rebuild | PASS | 2026-03-23 | 746d062 | ~35 min |
-| DRT-002 | Cold Rebuild | PASS | 2026-03-25 | 099b860 | ~50 min |
+| DRT-001 | Warm Rebuild | INVALIDATED | 2026-04-03 | pending rerun | ~35 min |
+| DRT-002 | Cold Rebuild | INVALIDATED | 2026-04-03 | pending rerun | ~50 min |
 | DRT-003 | PBS Restore | PASS | 2026-03-25 | 099b860 | ~20 min |
 | DRT-004 | Vault HA Failover | PASS | 2026-03-23 | 746d062 | ~5 min |
 | DRT-005 | Node Failure Recovery | PASS | 2026-03-23 | 746d062 | ~10 min |
@@ -35,6 +35,11 @@ the new result. Move the old result to the History table.
 ---
 
 ## DRT-001: Warm Rebuild
+
+**Status:** INVALIDATED by Sprint 002 changes to `rebuild-cluster.sh`
+branch safety, initial-deploy detection, last-known-prod comparison,
+and GitLab handoff behavior. Re-run required before the ratchet is valid
+again.
 
 **What it validates:** That `rebuild-cluster.sh` can fully restore a
 running cluster from production config with a warm Nix cache. All VMs
@@ -65,11 +70,13 @@ destruction and restored from PBS after.
 **Last Run:**
 ```
 DRT-001 Warm Rebuild
-Date:    2026-03-23 (manual Level 5 test)
-Commit:  746d062
-Result:  PASS
-Time:    29m 49s
-Notes:   Level 5 Test 2, run 150. 36/36 validation, pipeline green.
+Date:    2026-04-03
+Commit:  pending rerun
+Result:  INVALIDATED
+Time:    -
+Notes:   Sprint 002 changed rebuild-cluster.sh Step 0 branch safety,
+         initial-deploy detection, Layer 2 comparison, and Step 14.5/17
+         behavior. Re-run required.
 ```
 
 **History:**
@@ -81,6 +88,11 @@ Notes:   Level 5 Test 2, run 150. 36/36 validation, pipeline green.
 ---
 
 ## DRT-002: Cold Rebuild
+
+**Status:** INVALIDATED by Sprint 002 changes to `rebuild-cluster.sh`
+branch safety, initial-deploy detection, last-known-prod comparison,
+and GitLab handoff behavior. Re-run required before the ratchet is valid
+again.
 
 **What it validates:** That a fresh operator can clone the repo and
 build a complete cluster from scratch. Simulates the new-operator
@@ -108,11 +120,13 @@ clone.
 **Last Run:**
 ```
 DRT-002 Cold Rebuild
-Date:    2026-03-25 (manual Level 5 test)
-Commit:  099b860
-Result:  PASS
-Time:    47m
-Notes:   Level 5 Test 2 cold path validation.
+Date:    2026-04-03
+Commit:  pending rerun
+Result:  INVALIDATED
+Time:    -
+Notes:   Sprint 002 changed rebuild-cluster.sh Step 0 branch safety,
+         initial-deploy detection, Layer 2 comparison, and Step 14.5/17
+         behavior. Re-run required.
 ```
 
 **History:**

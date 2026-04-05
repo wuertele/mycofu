@@ -92,6 +92,27 @@ variable "smtp_config" {
   default     = ""
 }
 
+variable "tailscale_auth_key" {
+  description = "Tailscale pre-auth key (empty = no Tailscale)"
+  type        = string
+  sensitive   = true
+  default     = ""
+}
+
+variable "vault_approle_role_id" {
+  description = "Vault AppRole role_id for vault-agent"
+  type        = string
+  sensitive   = true
+  default     = ""
+}
+
+variable "vault_approle_secret_id" {
+  description = "Vault AppRole secret_id for vault-agent"
+  type        = string
+  sensitive   = true
+  default     = ""
+}
+
 variable "domain" {
   description = "Base domain (written to CIDATA to trigger recreation on domain change)"
   type        = string
@@ -120,3 +141,9 @@ variable "search_domain" {
   default     = ""
 }
 
+
+variable "vdb_restore_expected" {
+  description = "Whether vdb requires PBS restore"
+  type        = bool
+  default     = false
+}

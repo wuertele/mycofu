@@ -19,7 +19,7 @@ MOVES=(
   "module.dns_dev.module.dns2 pve02"
   "module.vault_prod.module.vault pve03"
   "module.vault_dev.module.vault pve03"
-  "module.pebble.module.pebble pve03"
+  "module.acme_dev.module.acme_dev pve03"
   "module.gitlab.module.gitlab pve03"
   "module.cicd.module.cicd pve01"
   "module.gatus.module.gatus pve02"

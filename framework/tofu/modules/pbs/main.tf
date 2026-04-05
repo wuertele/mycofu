@@ -50,7 +50,7 @@ resource "proxmox_virtual_environment_vm" "vm" {
 
   scsi_hardware = "virtio-scsi-single"
   # Boot from CD-ROM first during installation, then hard disk after
-  boot_order    = var.iso_file != "" ? ["ide3", "scsi0"] : ["scsi0"]
+  boot_order = var.iso_file != "" ? ["ide3", "scsi0"] : ["scsi0"]
 
   # CD-ROM: PBS ISO for installation (set iso_file = "" after install to detach)
   dynamic "cdrom" {
@@ -63,7 +63,7 @@ resource "proxmox_virtual_environment_vm" "vm" {
   network_device {
     bridge      = "vmbr0"
     model       = "virtio"
-    vlan_id     = var.vlan_id  # null = native/untagged (management network)
+    vlan_id     = var.vlan_id # null = native/untagged (management network)
     mac_address = var.mac_address
   }
 

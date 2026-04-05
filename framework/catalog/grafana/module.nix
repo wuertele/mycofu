@@ -190,6 +190,7 @@ in
     # --- vdb mount at /var/lib/grafana ---
     # Mount by label (not /dev/sdb) — device letter assignment is not stable
     # across VM recreations with virtio-scsi.
+    mycofu.vdbMountPoint = "/var/lib/grafana";
     fileSystems."/var/lib/grafana" = {
       device = "/dev/disk/by-label/grafana-data";
       fsType = "ext4";
@@ -305,10 +306,12 @@ in
         "network-online.target"
         "var-lib-grafana.mount"
         "grafana-tls-config.service"
+        "vdb-ready.target"
       ];
       requires = [
         "var-lib-grafana.mount"
         "grafana-tls-config.service"
+        "vdb-ready.target"
       ];
       wants = [ "network-online.target" ];
       wantedBy = [ "multi-user.target" ];

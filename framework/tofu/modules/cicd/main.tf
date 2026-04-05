@@ -17,19 +17,19 @@ terraform {
 module "cicd" {
   source = "../proxmox-vm"
 
-  vm_id         = var.vm_id
-  vm_name       = "cicd"
-  hostname      = "cicd"
-  instance_id   = "cicd"
-  target_node    = var.target_node
-  all_node_names = var.all_node_names
-  image_file_id = var.image
-  vlan_id       = null  # Management network (native/untagged)
-  mac_address   = var.mac_address
-  ssh_pubkey    = var.ssh_pubkey
+  vm_id               = var.vm_id
+  vm_name             = "cicd"
+  hostname            = "cicd"
+  instance_id         = "cicd"
+  target_node         = var.target_node
+  all_node_names      = var.all_node_names
+  image_file_id       = var.image
+  vlan_id             = null # Management network (native/untagged)
+  mac_address         = var.mac_address
+  ssh_pubkey          = var.ssh_pubkey
   operator_ssh_pubkey = var.operator_ssh_pubkey
-  storage_pool  = var.storage_pool
-  domain        = var.domain
+  storage_pool        = var.storage_pool
+  domain              = var.domain
 
   ip_address    = var.ip_address
   gateway       = var.gateway

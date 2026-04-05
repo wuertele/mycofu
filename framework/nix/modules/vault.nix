@@ -151,6 +151,7 @@ in
 
   # Mount data disk at /var/lib/vault (Raft storage)
   # base.nix mounts sdb at /var/lib/data — override for Vault
+  mycofu.vdbMountPoint = "/var/lib/vault";
   fileSystems."/var/lib/vault" = {
     device = "/dev/disk/by-label/vault-data";
     fsType = "ext4";
