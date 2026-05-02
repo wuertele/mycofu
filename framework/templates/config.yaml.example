@@ -1,0 +1,599 @@
+# site/config.yaml
+# This file is the single source of truth for all site-specific values.
+# The framework never hardcodes any of these values.
+#
+# Copy this file to site/config.yaml and replace all example values
+# with your own site-specific configuration.
+
+# --- Domain ---
+# The single source of truth for all DNS names. Changing this field and
+# rebuilding is all that's needed to migrate to a different domain.
+# Everything else is derived:
+#   DNS zones:    prod.<domain>, dev.<domain>
+#   GitLab URL:   https://gitlab.prod.<domain>
+#   Email sender: gatus@<domain>
+#   VM FQDNs:     <hostname>.<env>.<domain>
+domain: example.com                    # Your registered domain
+registrar: ionos                       # Where your domain is registered (for documentation)
+
+# OPTIONAL: IANA timezone (e.g., "America/New_York", "Europe/London").
+# Used by PBS answer file, NixOS VMs, log timestamps.
+# Set to match the timezone you select during Proxmox installation.
+# Default: UTC
+timezone: "UTC"
+
+# OPTIONAL: NTP server for all nodes and VMs.
+# Default: management gateway IP (most routers provide NTP).
+# Override if using a dedicated NTP appliance or public pool.
+# ntp_server: "192.168.1.1"
+
+# ACME certificate mode for prod environment.
+# "production" — Let's Encrypt production server. Real trusted certificates.
+#                Rate limit: 50 certificates per domain per week.
+# "staging"    — Let's Encrypt staging server. Untrusted certificates.
+#                Rate limit: 30,000 per domain per week. Use during initial
+#                setup and testing to avoid hitting production rate limits.
+# Dev environment always uses the local step-ca regardless of this setting.
+# OPTIONAL: defaults to "production"
+acme: production
+
+environments:
+  prod:
+    vlan_id: 10                        # VLAN ID for production
+    subnet: 10.0.10.0/24              # Production subnet (CIDR)
+    gateway: 10.0.10.1                # Production gateway IP
+  dev:
+    vlan_id: 20                        # VLAN ID for development
+    subnet: 10.0.20.0/24             # Development subnet (CIDR)
+    gateway: 10.0.20.1               # Development gateway IP
+
+# --- Firewall Zones (optional) ---
+# If your gateway supports zone-based firewalling (e.g., Unifi, OPNsense),
+# define the zones and inter-zone policies here. If your gateway uses
+# traditional firewall rules instead of zones, leave this section commented out.
+#
+# Zone names for prod and dev are defined here. The mapping is implicit:
+# environments.prod uses zones.prod, environments.dev uses zones.dev.
+#
+# Zone policies define the default traffic direction between zones.
+# "allow" = traffic permitted by default, "block" = denied by default.
+# Specific exceptions (e.g., PBS accessing NAS) are configured as firewall rules
+# on the gateway and are outside the scope of this config file.
+zones:
+  management:
+    name: Internal                     # Zone for the management/default network
+  prod:
+    name: ProdZone
+    policy:
+      to_management: allow             # Home devices need to reach prod services
+      from_management: allow           # Prod VMs (PBS, Gatus) may need NAS access
+      to_dev: block                    # Prod should never talk to dev
+      from_dev: block                  # Dev should never talk to prod
+  dev:
+    name: DevZone
+    policy:
+      to_management: block             # Dev is isolated (exception: workstation via firewall rule)
+      from_management: block           # Nothing on home LAN needs to reach dev
+      to_prod: block                   # Dev should never talk to prod
+      from_prod: block                 # Prod should never talk to dev
+
+# --- Management Network ---
+# The management network is the native (untagged) VLAN — VLAN ID 1 on most switches,
+# or whatever your switch treats as the default/native VLAN.
+# Proxmox nodes, the NAS, and the operator workstation live here.
+# Traffic on this network is untagged: Proxmox's management interface does not
+# add or expect VLAN tags. The switch delivers untagged frames to/from this subnet.
+# This network must be functional BEFORE any VLANs are configured.
+management:
+  vlan_id: 1                           # Native/default VLAN (typically 1, untagged)
+  subnet: 192.168.1.0/24              # Native LAN subnet
+  gateway: 192.168.1.1                # Router/gateway IP on the native LAN
+
+# --- Cluster Nodes ---
+# Minimum 2 nodes. 3+ recommended for HA with N+1 capacity.
+# Nodes may have different hardware (asymmetric clusters are supported).
+#
+# --- Replication Network Topologies ---
+#
+# The replication network carries ZFS replication, VM migration, and corosync
+# traffic. Two topologies are supported:
+#
+# topology: mesh (default)
+#   Direct point-to-point DAC cables between each node pair. No switch needed.
+#   For 3 nodes: 2 SFP+ ports per node, 3 DAC cables total.
+#   Scales as N*(N-1)/2 cables — practical for 3-4 nodes.
+#   Uses dummy0 /32 for corosync, dual-metric static routes for failover,
+#   ip_forward for relay, and a ping-based watchdog for asymmetric failure
+#   detection. See architecture.md for details.
+#
+#   Per-node config:
+#     repl_ip:    Corosync ring0 address (dummy0 /32). Must be reachable by
+#                 ALL nodes. All repl_ip addresses in the same /24 subnet.
+#     repl_peers: Physical point-to-point links. Each link has a /30 subnet.
+#
+# topology: switched (future)
+#   Dual redundant switches (A/B). Each node connects to both switches.
+#   Scales linearly — adding a node is always 2 cables.
+#   Uses standard shared subnets, no dummy0, no special routing, no watchdog.
+#   Standard Proxmox multi-link corosync pattern.
+#
+#   Per-node config:
+#     repl_ip:    Corosync ring0 address on switch-A subnet.
+#     repl_ifaces: Interface names and IPs for switch-A and switch-B.
+#                  (Schema TBD — will be defined when switched topology is
+#                  implemented.)
+#
+# To determine which interface connects to which peer (mesh topology):
+#   1. Cable all DAC links
+#   2. On each node: ip link set nic2 up; ip link set nic3 up
+#   3. Check which peer is reachable on which interface
+#   4. Record the mapping below
+#
+# Failover (mesh topology): configure-node-network.sh creates dual-metric
+# static routes to each peer's repl_ip — a direct route (low metric) and a
+# fallback route (high metric) through the third node. A ping-based watchdog
+# converts asymmetric link failures into symmetric ones. If a cable fails,
+# traffic reroutes automatically.
+#
+# MTU 9000 (jumbo frames) is set on all replication interfaces for throughput.
+
+# --- Replication Network Settings ---
+replication:
+  topology: mesh                       # "mesh" (point-to-point DAC) or "switched" (dual A/B switches)
+  corosync_subnet: 10.10.0.0/24       # Subnet for corosync addresses
+                                       #   mesh: /32 on dummy0 per node
+                                       #   switched: shared subnet on switch-A
+  mtu: 9000                            # MTU for all replication interfaces
+  health_port: 9100                    # HTTP port for repl-health endpoint on each node
+
+nodes:
+  - name: node1                        # Proxmox hostname
+    mgmt_ip: 192.168.1.101            # Management IP (for Proxmox UI, SSH)
+    ram_gb: 32                         # RAM on this node
+    mgmt_iface: nic0                   # Management network interface (in vmbr0)
+    repl_ip: 10.10.0.1                 # Corosync ring0 address (dummy0 /32)
+    repl_peers:
+      node2:
+        iface: nic2                    # Local interface connected to node2
+        local_ip: 10.10.1.1/30        # This node's IP on the point-to-point link
+        peer_ip: 10.10.1.2            # node2's IP on the point-to-point link
+      node3:
+        iface: nic3                    # Local interface connected to node3
+        local_ip: 10.10.2.1/30
+        peer_ip: 10.10.2.2
+  - name: node2
+    mgmt_ip: 192.168.1.102
+    ram_gb: 32
+    mgmt_iface: nic0
+    repl_ip: 10.10.0.2
+    repl_peers:
+      node1:
+        iface: nic2
+        local_ip: 10.10.1.2/30
+        peer_ip: 10.10.1.1
+      node3:
+        iface: nic3
+        local_ip: 10.10.3.1/30
+        peer_ip: 10.10.3.2
+  - name: node3
+    mgmt_ip: 192.168.1.103
+    ram_gb: 32
+    mgmt_iface: nic0
+    repl_ip: 10.10.0.3
+    repl_peers:
+      node1:
+        iface: nic2
+        local_ip: 10.10.2.2/30
+        peer_ip: 10.10.2.1
+      node2:
+        iface: nic3
+        local_ip: 10.10.3.2/30
+        peer_ip: 10.10.3.1
+
+# --- Off-Cluster NAS ---
+nas:
+  hostname: nas                        # Short hostname
+  ip: 192.168.1.200                   # NAS management IP
+  ssh_user: root                       # SSH user for configure-nas.sh (needs root/sudo for Docker, mkdir, chown)
+  postgres_method: native              # "native" (system PostgreSQL) or "docker" (Container Manager)
+  nfs_export: /volume1/pbs-datastore  # NFS export path for PBS backups
+  postgres_port: 5432                  # PostgreSQL port for OpenTofu state
+  postgres_ssl: false                  # Whether PostgreSQL accepts SSL connections.
+    # Synology DSM's native PostgreSQL does not enable SSL by default.
+    # Docker-based PostgreSQL also defaults to no SSL unless configured.
+    # When false, the OpenTofu pg backend connection string uses ?sslmode=disable.
+    # Set to true only if you have configured SSL certificates on PostgreSQL.
+
+# --- Proxmox ---
+proxmox:
+  image_storage_path: /var/lib/vz/template/iso  # Where VM images are uploaded on nodes.
+    # Proxmox's "local" storage uses the ISO content type for importable disk images.
+    # Files MUST have a .iso or .img extension — Proxmox silently ignores other
+    # extensions (.raw, .qcow2). The upload-image.sh script handles this automatically.
+  storage_pool: vmstore                # ZFS storage for VM disks.
+  # OPTIONAL: Use the free no-subscription APT repository instead of the
+  # enterprise repository (which requires a paid Proxmox subscription).
+  # Set to true if you do not have a Proxmox subscription. When true,
+  # configure-node-network.sh removes the enterprise repo files and adds
+  # the no-subscription repo on each node. Default: false (enterprise).
+  # no_subscription_repo: true
+    # Two-drive nodes: set to 'vmstore'. Run configure-node-storage.sh to
+    # create the pool on the data NVMe (separate from rpool for fault isolation).
+    #
+    # Single-drive nodes: set to 'local-zfs'. This uses rpool/data on the boot
+    # drive (created automatically by the Proxmox installer). No separate pool
+    # needed — configure-node-storage.sh detects this and skips gracefully.
+
+# --- Infrastructure VMs ---
+# Each VM has a pinned VMID, IP, MAC, and intended node.
+# VMIDs are stable across rebuilds — PBS backups stay associated.
+#
+# VMID scheme: hundreds digit = category, odd = dev, even = prod.
+#   1xx = shared infra (gitlab=150, cicd=160, pbs=190)
+#   3xx = dev infra     4xx = prod infra
+#   5xx = dev apps      6xx = prod apps
+#   7xx = vendor appliance apps (HAOS, etc.)
+# Same role = same offset across dev/prod (e.g., dns1=01 → 301/401).
+#
+# IPs are static — assigned via CIDATA write_files at VM creation.
+# No DHCP reservations are needed for VMs.
+#
+# MAC addresses are pre-assigned so that network identity is stable across
+# rebuilds. OpenTofu passes these MACs to Proxmox when creating VMs.
+# Use the locally administered range (02:xx:xx:xx:xx:xx) to avoid collisions
+# with real hardware MACs. The 02 prefix sets the "locally administered" bit.
+#
+# Generate a random locally administered MAC address:
+#   printf '02:%02x:%02x:%02x:%02x:%02x\n' $((RANDOM%256)) $((RANDOM%256)) $((RANDOM%256)) $((RANDOM%256)) $((RANDOM%256))
+#
+# Generate all MACs at once (one per line, paste into the fields below):
+#   for i in $(seq 1 10); do printf '02:%02x:%02x:%02x:%02x:%02x\n' $((RANDOM%256)) $((RANDOM%256)) $((RANDOM%256)) $((RANDOM%256)) $((RANDOM%256)); done
+#
+vms:
+  dns1_prod:
+    vmid: 401
+    ip: 10.0.10.50
+    mac: "02:00:00:00:01:01"           # Replace with generated MAC
+    node: node1                        # Intended Proxmox node — used by rebalance-cluster.sh
+    pool: prod
+  dns2_prod:
+    vmid: 402
+    ip: 10.0.10.51
+    mac: "02:00:00:00:01:02"           # Replace with generated MAC
+    node: node2                        # Anti-affinity: dns2 on different node than dns1
+    pool: prod
+  vault_prod:
+    vmid: 403
+    ip: 10.0.10.52
+    mac: "02:00:00:00:01:03"           # Replace with generated MAC
+    node: node3
+    pool: prod
+    backup: true                        # Precious state: Raft storage
+  dns1_dev:
+    vmid: 301
+    ip: 10.0.20.50
+    mac: "02:00:00:00:02:01"           # Replace with generated MAC
+    node: node1
+    pool: dev
+  dns2_dev:
+    vmid: 302
+    ip: 10.0.20.51
+    mac: "02:00:00:00:02:02"           # Replace with generated MAC
+    node: node2
+    pool: dev
+  vault_dev:
+    vmid: 303
+    ip: 10.0.20.52
+    mac: "02:00:00:00:02:03"           # Replace with generated MAC
+    node: node3
+    pool: dev
+  acme_dev:
+    vmid: 305
+    ip: 10.0.20.53
+    mac: "02:00:00:00:02:04"           # Replace with generated MAC
+    node: node3
+    pool: dev
+  # --- Shared operational services (management network) ---
+  # PBS and CI/CD live on the management network (not on a VLAN).
+  # Their clients are Proxmox nodes and the operator, not VMs.
+  # See architecture.md section 5.3.
+  pbs:
+    vmid: 190
+    ip: 192.168.1.60                    # Management network IP
+    mac: "02:00:00:00:01:04"           # Replace with generated MAC
+    node: node3
+    pool: control-plane
+  gitlab:
+    vmid: 150
+    ip: 192.168.1.62                    # Management network (Git hosting + web UI, LE cert)
+    mac: "02:00:00:00:01:07"           # Replace with generated MAC
+    node: node3
+    pool: control-plane
+    backup: true                        # Precious state: repositories, CI/CD config
+  cicd:
+    vmid: 160
+    ip: 192.168.1.61                    # Management network (GitLab Runner)
+    mac: "02:00:00:00:01:05"           # Replace with generated MAC
+    node: node1
+    pool: control-plane
+  # --- Test application (one per environment) ---
+  testapp_dev:
+    vmid: 500
+    ip: 10.0.20.54
+    mac: "02:00:00:00:02:05"           # Replace with generated MAC
+    node: node2
+    pool: dev
+  testapp_prod:
+    vmid: 600
+    ip: 10.0.10.54
+    mac: "02:00:00:00:01:08"           # Replace with generated MAC
+    node: node2
+    pool: prod
+  # --- Prod-only service (prod VLAN) ---
+  # Gatus monitors prod services and alerts on prod outages.
+  # It is NOT a shared service — see architecture.md section 5.3.
+  gatus:
+    vmid: 404
+    ip: 10.0.10.62                      # Prod VLAN IP
+    mac: "02:00:00:00:01:06"           # Replace with generated MAC
+    node: node2
+    pool: prod
+
+# --- DNS ---
+public_ip: 203.0.113.1                # Your public IP (for registrar NS records, port 53 forwarding)
+
+# --- Email / Alerting ---
+email:
+  smtp_host: smtp.example.com
+  smtp_port: 587
+  smtp_auth: true                      # true = username/password auth, false = IP-based relay
+  to: operator@example.com
+
+# --- CI/CD ---
+cicd:
+  project_name: mycofu                 # GitLab project name. Should match the repo name.
+  system: gitlab                       # CI/CD platform (gitlab, forgejo, github-actions)
+  runner_tags: ["infra", "deploy"]     # Tags for the CI runner
+  runner_cores: 8                      # CPU cores for the runner VM (more = faster builds)
+  runner_ram_mb: 16384                 # RAM in MB for the runner VM (nix builds are memory-hungry)
+  # Runner registration token is stored in SOPS, not here
+
+github:
+  remote_url: git@github.com:your-org/mycofu.git  # Only used when publish.github.enabled below is true.
+
+# --- Publish ---
+# Mirror framework code to a public github repo after each prod deploy.
+# Default false: downstream adopters do not need a public mirror to run Mycofu.
+# Set to true (and configure github.remote_url above plus the seeding ceremony
+# in OPERATIONS.md) to enable the prod pipeline's publish:github stage.
+publish:
+  github:
+    enabled: false
+
+# --- SSH ---
+# Operator SSH public key — paste your workstation's public key.
+# This key is installed on all managed hosts for operator SSH access.
+# The CI runner uses a separate key generated by bootstrap-sops.sh.
+# Find your key: cat ~/.ssh/id_*.pub
+operator_ssh_pubkey: "ssh-ed25519 AAAA... operator@workstation"  # REQUIRED
+
+# --- Storage ---
+storage:
+  pool_name: vmstore                     # ZFS pool name on each node's data NVMe.
+    # Must match proxmox.storage_pool above. For single-drive nodes, set both
+    # to 'local-zfs'.
+
+# --- Cluster ---
+cluster:
+  # Proxmox cluster name. Must be 15 characters or fewer (corosync limitation).
+  # Allowed characters: lowercase letters, digits, and hyphens.
+  #
+  # If set to AUTO, form-cluster.sh will attempt to derive a name from the domain:
+  #   example.com       → "example" (7 chars)  ✓
+  #   mylab.io          → "mylab" (5 chars)    ✓
+  #   smithlab.com      → "smithlab" (8 chars)  ✓
+  #   my-long-domain-name.com → error: auto-generated name exceeds 15 chars
+  #
+  # The auto-generation takes the part before the first dot. If that exceeds
+  # 15 characters, the script will fail with an error asking you to set this
+  # field manually.
+  #
+  # Tips for choosing a name:
+  #   - Keep it short and memorable (e.g., "homelab", "infra", "mylab")
+  #   - All nodes in the cluster share this name — it cannot be changed later
+  #     without destroying and recreating the cluster
+  #   - The name appears in pvecm status, corosync config, and Proxmox UI
+  name: AUTO
+
+# --- Platform Details (used for bringup guide generation) ---
+# These fields do not affect the framework or OpenTofu — no automation reads them.
+# They are metadata used by the bringup generator (framework/scripts/generate-bringup.sh)
+# to produce a site-specific step-by-step checklist with concrete UI instructions.
+platforms:
+  gateway:
+    type: unifi                        # unifi | pfsense | opnsense | mikrotik
+    url: https://192.168.1.1           # Gateway management UI URL
+    model: UDM-Pro                     # Hardware model (for documentation only)
+    version: "10.1.85"                 # Optional: Unifi Network app version (UI paths vary by version)
+  switch:
+    type: unifi                        # unifi | standalone (if separate from gateway)
+    # If switch is managed by the same controller as the gateway (e.g., Unifi),
+    # no separate URL is needed. Otherwise:
+    # url: https://192.168.1.2
+  nas:
+    type: synology                     # synology | truenas | custom-linux
+    url: https://192.168.1.200:5001    # NAS management UI URL (DSM, TrueNAS, etc.)
+    model: RS2423+                     # Hardware model (for documentation only)
+  registrar:
+    type: ionos                        # ionos | cloudflare | namecheap | route53 | gandi
+    url: https://my.ionos.com          # Registrar management URL
+  proxmox:
+    url: https://192.168.1.101:8006    # Proxmox web UI URL (first node)
+
+# --- Nix Builder ---
+# How NixOS VM images are built. Building NixOS images requires a Linux
+# execution environment. If your workstation is macOS, choose a builder type.
+#
+# Types:
+#   local          - Workstation is Linux (no builder setup needed)
+#   linux-builder  - Nix-managed NixOS VM on local macOS (recommended for macOS)
+#   remote         - Delegate builds to a Linux host over SSH
+#
+# The 'remote' option installs the Nix *package manager* on the remote host
+# (any Linux distro, including the Debian-based Proxmox nodes). It does NOT
+# require the remote host to run NixOS.
+# --- Nix Linux Builder (macOS workstation) ---
+# The framework builds x86_64-linux NixOS images. On macOS, this requires
+# a linux-builder VM. The recommended nix-darwin configuration:
+#
+#   nix.linux-builder = {
+#     enable = true;
+#     ephemeral = true;     # Recreate disk on restart (required for config changes)
+#     maxJobs = 4;
+#     config = {
+#       virtualisation = {
+#         darwin-builder = {
+#           diskSize = 80 * 1024;    # 80GB — must fit the largest image closure
+#           memorySize = 8 * 1024;   # 8GB RAM
+#         };
+#         cores = 6;
+#       };
+#     };
+#   };
+#
+# After changing this config: darwin-rebuild switch, then restart the builder.
+#
+# IMPORTANT: Do NOT run nix-collect-garbage on the host while the builder is
+# in active use. The host's /nix/store is the builder's read-only cache.
+# GC-ing it forces the builder to rebuild paths into its writable overlay,
+# which can overflow on large builds (GitLab: ~6.4GB closure).
+#
+# If you must GC, repopulate the shared closure afterward:
+#   nix build .#packages.x86_64-linux.gitlab-image --no-link
+nix_builder:
+  # Builder type: 'linux-builder' (macOS), 'local' (Linux), 'remote' (SSH to node)
+  type: linux-builder                  # REQUIRED: set based on your workstation OS
+
+  # Remote builder host (only for type: remote)
+  # remote_host: 192.168.1.101        # IP or hostname of the remote Linux builder
+  # remote_user: root                  # SSH user on the remote builder
+  # remote_ssh_key: ~/.ssh/id_ed25519 # SSH key for connecting to the builder
+  # max_jobs: 4                        # Max parallel Nix build jobs on the builder
+  # speed_factor: 1                    # Relative speed (higher = preferred when multiple builders exist)
+
+  # Builder VM resources (only for type: linux-builder on macOS).
+  # The Nix default (1 core, 3 GB) is insufficient for large builds like Vault.
+  # Set these to match your workstation's available resources.
+  cpus: 8                             # OPTIONAL: default 8
+  memory_gb: 24                        # OPTIONAL: default 24
+  store_gb: 40                          # OPTIONAL: builder VM disk size in GB (default 40)
+
+# --- PBS (Proxmox Backup Server) ---
+# Proxmox Backup Server is a vendor appliance (official Proxmox ISO, not NixOS).
+# It runs on the management network (not on a VLAN) because its clients are
+# Proxmox nodes, not VMs. See architecture.md section 5.3.
+# Only Category 3 (precious state) VMs are backed up — currently Vault only.
+pbs:
+  keep_daily: 7                        # OPTIONAL: daily backup retention (default: 7)
+  keep_weekly: 4                       # OPTIONAL: weekly backup retention (default: 4)
+  keep_monthly: 6                      # OPTIONAL: monthly backup retention (default: 6)
+  datastore_name: backups              # OPTIONAL: PBS datastore name (default: backups)
+  datastore_mount: /mnt/datastore/backups  # OPTIONAL: NFS mount path inside PBS VM
+  backup_schedule: "02:00"             # OPTIONAL: daily backup time, 24h format (default: 02:00)
+  raft_snapshot_schedule: "01:30"      # OPTIONAL: Vault Raft snapshot time (must run before backup_schedule)
+  iso: proxmox-backup-server_4.1-1.iso # PBS ISO filename — must match version at https://download.proxmox.com/iso/
+
+# --- Hardware Details (derived, not consumed by framework) ---
+# N+1 capacity: total VM load must fit on the (N-1) smallest nodes.
+# With asymmetric nodes, the budget is NOT simply total_ram × (N-1)/N.
+# Example: 3 nodes with 32GB, 32GB, 16GB → if the 16GB node fails,
+#   survivors have 64GB. But if a 32GB node fails, survivors have 48GB.
+#   The budget is the MINIMUM survivor capacity: 48GB.
+hardware:
+  node_count: 3                        # Derived from nodes list length
+  total_ram_gb: 96                     # Sum of all nodes[].ram_gb
+  n_plus_1_budget_gb: 48              # Min RAM when any single node is removed
+
+# ==============================================================================
+# Applications (operator-managed — add your applications below)
+# ==============================================================================
+# See framework/catalog/ for available applications.
+# Run 'enable-app.sh <name>' to add an application.
+# Everything above this line is framework-managed.
+
+applications:
+  # --- Uncomment to enable ---
+  # Each application needs a catalog module in framework/catalog/<name>/.
+  # Per-environment VMIDs follow the scheme: 5xx = dev apps, 6xx = prod apps.
+  # Same role uses the same offset (e.g., influxdb=01 → 501/601).
+
+  # influxdb:
+  #   enabled: true
+  #   node: node2
+  #   ram: 2048
+  #   disk_size: 4
+  #   data_disk_size: 20
+  #   backup: true            # Has precious state (time-series data)
+  #   monitor: true           # Health check defined in framework/catalog/influxdb/health.yaml
+  #   proxmox_metrics: true   # Configure Proxmox nodes to send metrics here
+  #   environments:
+  #     prod:
+  #       vmid: 601
+  #       ip: 10.0.10.55
+  #       mac: "02:xx:xx:xx:xx:xx"
+  #     dev:
+  #       vmid: 501
+  #       ip: 10.0.20.55
+  #       mac: "02:xx:xx:xx:xx:xx"
+
+  # grafana:
+  #   enabled: true
+  #   node: node3
+  #   ram: 1024
+  #   disk_size: 4
+  #   data_disk_size: 4
+  #   backup: false           # Dashboards can be provisioned from Git
+  #   monitor: true           # Health check defined in framework/catalog/grafana/health.yaml
+  #   environments:
+  #     prod:
+  #       vmid: 602
+  #       ip: 10.0.10.56
+  #       mac: "02:xx:xx:xx:xx:xx"
+  #     dev:
+  #       vmid: 502
+  #       ip: 10.0.20.56
+  #       mac: "02:xx:xx:xx:xx:xx"
+
+  # roon:
+  #   enabled: true
+  #   ram: 4096
+  #   disk_size: 4
+  #   data_disk_size: 50
+  #   backup: true
+  #   monitor: false          # No HTTP health endpoint
+  #   # Optional: network mounts delivered via CIDATA, mounted at boot
+  #   mounts:
+  #     - path: /music
+  #       device: "192.168.1.200:/volume1/Media/Music"
+  #       fstype: nfs
+  #       options: "ro,soft,timeo=30,retrans=3,nofail"
+  #   environments:
+  #     prod:
+  #       vmid: 603
+  #       ip: 10.0.10.57
+  #       mac: "02:xx:xx:xx:xx:xx"
+  #       node: node2         # Per-env node override (optional)
+  #       # Optional: management NIC on vmbr1 for multicast/discovery protocols
+  #       mgmt_nic:
+  #         name: "roon-mgmt"
+  #         ip: 192.168.1.67
+  #         mac: "02:xx:xx:xx:xx:xx"
+  #     dev:
+  #       vmid: 503
+  #       ip: 10.0.20.57
+  #       mac: "02:xx:xx:xx:xx:xx"
+  #       node: node3
+  #       mgmt_nic:
+  #         name: "roon-mgmt"
+  #         ip: 192.168.1.66
+  #         mac: "02:xx:xx:xx:xx:xx"

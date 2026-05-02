@@ -1,0 +1,244 @@
+## Step 0 Validation
+
+This is a comprehensive check of all components. If you verified each section
+as you went, most of these should already pass. Run through them to confirm
+nothing was missed or broken by subsequent steps.
+
+Run `tests/step0.sh` for automated checks, or verify manually below.
+
+### V0.1 — Management Network
+
+Ping every node and the NAS from your workstation:
+
+```bash
+{%- for node in nodes %}
+ping -c 1 {{ node.mgmt_ip }}   # {{ node.name }}
+{%- endfor %}
+ping -c 1 {{ nas.ip }}          # NAS ({{ nas.hostname }})
+```
+
+- [ ] All {{ nodes | length }} nodes respond to ping
+- [ ] NAS responds to ping
+
+### V0.2 — Cluster Health
+
+```bash
+ssh root@{{ nodes[0].mgmt_ip }} pvecm status
+```
+
+- [ ] Cluster name: `{{ cluster_name }}`
+- [ ] All {{ nodes | length }} nodes listed as members
+- [ ] `Quorate: Yes`
+- [ ] All nodes show as online
+
+### V0.3 — ZFS Pools
+
+On each node:
+{%- for node in nodes %}
+
+```bash
+ssh root@{{ node.mgmt_ip }} zpool status {{ storage.pool_name }}
+```
+- [ ] {{ node.name }}: `{{ storage.pool_name }}` is ONLINE, no errors
+{%- endfor %}
+
+### V0.4 — VLAN Connectivity
+
+Attach a test device to each VLAN and verify DHCP:
+
+**Prod VLAN ({{ environments.prod.vlan_id }}):**
+- [ ] Device receives IP in {{ environments.prod.subnet }}
+- [ ] Gateway: {{ environments.prod.gateway }}
+- [ ] DNS servers: {{ vms.dns1_prod.ip }}, {{ vms.dns2_prod.ip }}
+- [ ] Search domain: {{ environments.prod.dns_domain }}
+
+**Dev VLAN ({{ environments.dev.vlan_id }}):**
+- [ ] Device receives IP in {{ environments.dev.subnet }}
+- [ ] Gateway: {{ environments.dev.gateway }}
+- [ ] DNS servers: {{ vms.dns1_dev.ip }}, {{ vms.dns2_dev.ip }}
+- [ ] Search domain: {{ environments.dev.dns_domain }}
+
+### Firewall Zones
+{% if has_zones %}
+- [ ] Verify zone **{{ zones.prod.name }}** exists in Settings → Profiles → Zones
+- [ ] Verify zone **{{ zones.dev.name }}** exists in Settings → Profiles → Zones
+- [ ] Verify Prod network is assigned to **{{ zones.prod.name }}**
+- [ ] Verify Dev network is assigned to **{{ zones.dev.name }}**
+- [ ] Verify a device on Dev VLAN cannot reach management subnet:
+      `ping {{ management.gateway }}` should fail (or be blocked)
+- [ ] Verify a device on Prod VLAN can reach management subnet:
+      `ping {{ management.gateway }}` should succeed
+{% endif %}
+
+### V0.5 — DHCP Search Domain
+
+From a DHCP client on each VLAN:
+- [ ] Prod VLAN: `hostname -d` or `resolvectl` shows `{{ environments.prod.dns_domain }}`
+- [ ] Dev VLAN: `hostname -d` or `resolvectl` shows `{{ environments.dev.dns_domain }}`
+
+### V0.6 — NAS PostgreSQL and NFS
+
+Run the automated verification:
+```bash
+framework/scripts/configure-nas.sh --verify
+```
+{% if nas.postgres_method | default('native') == 'docker' %}
+- [ ] All PostgreSQL checks pass (TCP port {{ nas.postgres_port }}, container running, pg_isready, schemas)
+{% else %}
+- [ ] All PostgreSQL checks pass (pg_isready, TCP port {{ nas.postgres_port }}, database, user, schemas, pg_hba.conf)
+{% endif %}
+- [ ] Backup configured (script deployed, cron entry in /etc/crontab)
+- [ ] All NFS checks pass (export `{{ nas.nfs_export }}` visible, mount test from {{ nodes[0].name }})
+
+### Port 53 Forwarding (WAN:53 → VM:8053)
+- [ ] Verify port forwarding rules exist in Policy Engine → Port Forwarding:
+      `DNS-forward-tcp` and `DNS-forward-udp` (or a single "Both" rule)
+      WAN Port: `53`, Forward Port: `8053` (targets the authoritative, not the recursor)
+- [ ] From an external network: `nmap -p 53 {{ public_ip }}`
+      Expected: open or filtered (not closed)
+- [ ] Public delegation test:
+      `curl -s "https://dns.google/resolve?name={{ environments.prod.dns_domain }}&type=SOA" | jq .Status`
+      Expected: `0` (NOERROR — Google can resolve via your authoritative server)
+
+### V0.9 — Proxmox VLAN Awareness
+
+On each node:
+{%- for node in nodes %}
+```bash
+ssh root@{{ node.mgmt_ip }} grep -A5 vmbr0 /etc/network/interfaces
+```
+- [ ] {{ node.name }}: `bridge-vlan-aware yes` present
+{%- endfor %}
+
+### V0.10 — Inter-node SSH Connectivity
+
+{%- for node in nodes %}
+{%- for peer in nodes %}
+{%- if node.name != peer.name %}
+- [ ] {{ node.name }} → {{ peer.name }}: `ssh root@{{ node.mgmt_ip }} "ssh -o BatchMode=yes root@{{ peer.mgmt_ip }} hostname"` returns `{{ peer.name }}`
+{%- endif %}
+{%- endfor %}
+{%- endfor %}
+
+### V0.11 — Node-to-Node Connectivity
+
+Management network — from each node, ping every other node:
+{%- for node in nodes %}
+{%- for peer in nodes %}
+{%- if node.name != peer.name %}
+- [ ] {{ node.name }} → {{ peer.name }}: `ssh root@{{ node.mgmt_ip }} ping -c 1 {{ peer.mgmt_ip }}`
+{%- endif %}
+{%- endfor %}
+{%- endfor %}
+
+{%- if has_replication_network %}
+
+Replication network (point-to-point):
+{%- for node in nodes %}
+{%- if node.repl_peers is defined and node.repl_peers %}
+{%- for peer_name, peer in node.repl_peers.items() %}
+- [ ] From {{ node.name }}: `ping -c 3 {{ peer.peer_ip }}` succeeds
+{%- endfor %}
+{%- endif %}
+{%- endfor %}
+
+Corosync addresses (dummy0):
+{%- for node in nodes %}
+{%- if node.repl_ip is defined and node.repl_ip %}
+- [ ] {{ node.name }}: `ip addr show dummy0` shows {{ node.repl_ip }}/32
+{%- endif %}
+{%- endfor %}
+
+Corosync reachability:
+{%- for node in nodes %}
+{%- for peer in nodes %}
+{%- if node.name != peer.name and node.repl_ip is defined and peer.repl_ip is defined %}
+- [ ] From {{ node.name }}: `ping -c 1 {{ peer.repl_ip }}` succeeds
+{%- endif %}
+{%- endfor %}
+{%- endfor %}
+
+Corosync links:
+```bash
+ssh root@{{ nodes[0].mgmt_ip }} corosync-cfgtool -s
+```
+- [ ] Link 0 (replication mesh): all nodes connected, no faults
+- [ ] Link 1 (management network): all nodes connected, no faults
+
+{% if replication.topology == 'mesh' %}
+Replication watchdog:
+{%- for node in nodes %}
+- [ ] {{ node.name }}: `ssh root@{{ node.mgmt_ip }} systemctl is-active repl-watchdog.timer` → active
+{%- endfor %}
+{%- endif %}
+
+Replication health endpoint:
+{%- for node in nodes %}
+- [ ] {{ node.name }}: `curl -s http://{{ node.mgmt_ip }}:{{ replication.health_port | default(9100) }}/health | jq .healthy` → true
+{%- endfor %}
+
+iRDMA blacklist:
+{%- for node in nodes %}
+- [ ] {{ node.name }}: `ssh root@{{ node.mgmt_ip }} lsmod | grep irdma` → (empty output)
+{%- endfor %}
+{%- endif %}
+
+### V0.12 — Public DNS Delegation
+
+Verify the subdomain delegation is configured correctly at the registrar:
+
+```bash
+# Nameserver A records — should return your public IP
+dig A dns1.{{ domain }}
+# Expected: {{ public_ip }}
+
+dig A dns2.{{ domain }}
+# Expected: {{ public_ip }}
+
+# Subdomain delegation — should return your DNS servers
+dig NS prod.{{ domain }}
+# Expected: dns1.{{ domain }}. and dns2.{{ domain }}.
+
+# Base domain NS — should still be the registrar's nameservers
+dig NS {{ domain }}
+# Expected: IONOS default nameservers (NOT dns1/dns2.{{ domain }})
+```
+
+- [ ] `dig A dns1.{{ domain }}` returns `{{ public_ip }}`
+- [ ] `dig A dns2.{{ domain }}` returns `{{ public_ip }}`
+- [ ] `dig NS prod.{{ domain }}` returns `dns1.{{ domain }}` and `dns2.{{ domain }}`
+- [ ] `dig NS {{ domain }}` still returns the registrar's default nameservers (unchanged)
+- [ ] Dev DNS is NOT publicly delegated (no NS records for dev.{{ domain }})
+
+### V0.13 — Snippet Storage
+
+Verify cloud-init snippet storage is enabled on the Proxmox cluster:
+
+```bash
+framework/scripts/configure-storage.sh --verify
+```
+- [ ] `ssh root@{{ nodes[0].mgmt_ip }} "grep snippets /etc/pve/storage.cfg"` shows `snippets` in the content line
+{%- for node in nodes %}
+- [ ] {{ node.name }}: `/var/lib/vz/snippets/` directory exists
+{%- endfor %}
+
+### SOPS and Secrets
+
+- [ ] `sops -d site/sops/secrets.yaml > /dev/null` exits 0
+- [ ] `git status` does not show `operator.age.key`
+- [ ] `operator.age.key` has been backed up to a secure location (operator must confirm)
+
+{%- if nix_builder is defined and nix_builder.type is defined %}
+
+### V-NixBuilder — Nix Linux Builder
+
+```bash
+framework/scripts/setup-nix-builder.sh --verify
+```
+- [ ] Builder type `{{ nix_builder.type }}` is configured and functional
+- [ ] Can build a Linux derivation from the workstation
+{%- endif %}
+
+---
+
+**All checks passed?** Proceed to Step 1: Repository Bootstrap and SOPS Setup.

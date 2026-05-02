@@ -1,0 +1,159 @@
+## Step 6: PBS and Backup Infrastructure
+
+Proxmox Backup Server (PBS) is a vendor appliance — it runs the official Proxmox
+ISO, not NixOS. It is a shared operational service and lives on the **management
+network** (native/untagged VLAN), not on an environment VLAN. Its clients are
+Proxmox nodes, not VMs. See architecture.md section 5.3.
+
+### 6.1 Download and Upload PBS ISO
+
+Download the official PBS ISO from Proxmox:
+
+```bash
+# Download PBS ISO (check https://www.proxmox.com/en/downloads for current version)
+wget https://enterprise.proxmox.com/iso/{{ pbs.iso }}
+
+# Upload to a Proxmox node
+scp {{ pbs.iso }} root@{{ nodes[0].mgmt_ip }}:{{ proxmox.image_storage_path }}/
+```
+
+Or download via the Proxmox web UI: Datacenter → Storage → local → ISO Images → Download from URL.
+
+- [ ] ISO `{{ pbs.iso }}` uploaded to Proxmox ISO storage
+
+### 6.2 Deploy PBS VM
+
+```bash
+cd site/tofu
+framework/scripts/tofu-wrapper.sh apply
+```
+
+This creates the PBS VM with the ISO attached as a CD-ROM.
+
+- [ ] PBS VM created in Proxmox
+
+### 6.3 Install PBS from ISO
+
+Open the Proxmox web UI console for the PBS VM and boot from the ISO.
+
+PBS is on the **management network** (no VLAN tag). Use the management subnet
+settings, not a VLAN subnet:
+
+| Setting | Value |
+|---------|-------|
+| Target disk | vda |
+| Hostname | pbs.{{ environments.prod.dns_domain }} |
+| IP | {{ vms.pbs.ip }}/{{ management.subnet | cidr_prefix }} |
+| Gateway | {{ management.gateway }} |
+| DNS | {{ vms.dns1_prod.ip }}, {{ vms.dns2_prod.ip }} |
+
+Set a root password and record it — this is the PBS admin credential.
+
+- [ ] Installation complete, VM rebooted
+- [ ] PBS web UI accessible at `https://{{ vms.pbs.ip }}:8007`
+
+### 6.4 Detach ISO
+
+After installation, update `site/tofu/main.tf` to set `iso_file = ""` for the PBS
+module, then re-apply:
+
+```bash
+cd site/tofu
+framework/scripts/tofu-wrapper.sh apply
+```
+
+- [ ] ISO detached from PBS VM
+
+### 6.5 Store PBS Root Password in SOPS
+
+Do NOT paste the password into any chat or log. Add it directly to SOPS:
+
+```bash
+sops --set '["pbs_root_password"] "<password>"' site/sops/secrets.yaml
+git add site/sops/secrets.yaml
+git commit -m "sops: add PBS root password"
+```
+
+### 6.6 Run PBS Configuration Script
+
+The `configure-pbs.sh` script automates all remaining PBS configuration:
+SSH key setup, NFS mount, datastore creation, retention policy, API token,
+Proxmox storage registration, and backup jobs.
+
+```bash
+framework/scripts/configure-pbs.sh
+```
+
+- [ ] Script completes successfully
+
+### 6.7 Verify PBS Configuration
+
+```bash
+framework/scripts/configure-pbs.sh --verify
+```
+
+- [ ] All checks pass
+
+### 6.8 DHCP Reservation
+
+PBS uses a static IP set during installation. Create a DHCP reservation on
+the management network for `{{ vms.pbs.ip }}` → `{{ vms.pbs.mac }}` to prevent
+conflicts, even though PBS uses a static IP internally.
+
+- [ ] DHCP reservation created on management network
+
+### 6.9 Vault Raft Snapshot Timer
+
+The Vault NixOS image includes a systemd timer that runs at {{ pbs.raft_snapshot_schedule }}
+(before the {{ pbs.backup_schedule }} backup window) to take a consistent Raft snapshot.
+
+After rebuilding and redeploying the Vault image:
+
+```bash
+ssh root@<vault-ip> systemctl list-timers vault-raft-snapshot
+```
+
+- [ ] Timer active on vault-dev
+- [ ] Timer active on vault-prod
+
+### 6.10 SOPS Entries Checklist
+
+- [ ] `pbs_root_password` added to SOPS
+- [ ] `pbs_api_token` added to SOPS
+
+### 6.11 Verification
+
+```bash
+# V6.1 — PBS accessible from all nodes (management network, no VLAN workarounds)
+for node_ip in {{ nodes | map(attribute='mgmt_ip') | join(' ') }}; do
+  ssh root@$node_ip ping -c 1 {{ vms.pbs.ip }}
+done
+
+# V6.2 — PBS API returns version info
+curl -sk https://{{ vms.pbs.ip }}:8007/api2/json/version
+
+# V6.3 — NFS datastore mounted
+ssh root@{{ vms.pbs.ip }} df -h {{ pbs.datastore_mount }}
+
+# V6.4 — Manual backup test
+vzdump <vault-dev-vmid> --storage pbs-nas --mode snapshot --compress zstd
+
+# V6.5 — No VLAN sub-interfaces on nodes (should all be "clean")
+for node_ip in {{ nodes | map(attribute='mgmt_ip') | join(' ') }}; do
+  ssh root@$node_ip ip link show vmbr0.10 2>/dev/null && echo "STALE" || echo "clean"
+done
+
+# V6.6 — Proxmox storage points to management IP
+pvesh get /storage/pbs-nas --output-format json | jq .server
+
+# V6.7 — Vault Raft snapshot timer active
+ssh root@<vault-ip> systemctl list-timers vault-raft-snapshot
+```
+
+- [ ] V6.1: All nodes can reach PBS on management network
+- [ ] V6.2: PBS API responds
+- [ ] V6.3: NFS datastore mounted and healthy
+- [ ] V6.4: Manual backup completes successfully
+- [ ] V6.5: No stale VLAN sub-interfaces on nodes
+- [ ] V6.6: Proxmox storage config uses management IP
+- [ ] V6.7: Vault Raft snapshot timer active and functional

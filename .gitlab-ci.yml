@@ -1,0 +1,1321 @@
+# .gitlab-ci.yml — Infrastructure CI/CD pipeline.
+#
+# Two-tier deployment model (architecture.md section 10.3):
+# Tier 1 (pipeline): Data-plane VMs — DNS, Vault, Pebble, Gatus, apps.
+# Tier 2 (workstation): Control-plane VMs — GitLab, CI/CD runner, PBS.
+# The pipeline builds ALL roles (verifies buildability) but only deploys
+# data-plane targets. Control-plane images are built and uploaded, ready
+# for the operator to activate from the workstation.
+#
+# Branch model (architecture.md section 13.3):
+# dev branch push  → build + upload + deploy-dev + test-dev
+# prod branch push → build + upload + deploy-prod + test-prod
+# MR (any target)  → validate + build (no deploy)
+# Other branches   → no pipeline
+#
+# Runner: shell executor with all infrastructure tools (nix, tofu, sops, etc.)
+# Secrets: SOPS age key at /run/secrets/sops/age-key on the runner VM.
+
+# Prevent duplicate pipelines: only run for MR events or dev/prod pushes.
+# Feature branch pushes without an MR produce no pipeline.
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "prod"
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+
+stages:
+  - validate
+  - build
+  - deploy-dev
+  - deploy-control-plane-dev
+  - test-dev
+  - deploy-prod
+  - deploy-control-plane-prod
+  - test-prod
+  - publish-github
+
+variables:
+  SOPS_AGE_KEY_FILE: /run/secrets/sops/age-key
+
+# --- Validate ---
+
+validate:plan:
+  stage: validate
+  tags: [infra]
+  script:
+    - echo "=== OpenTofu Init ==="
+    - framework/scripts/tofu-wrapper.sh init -input=false
+    - echo "=== OpenTofu Validate ==="
+    - framework/scripts/tofu-wrapper.sh validate
+    - echo "=== OpenTofu Plan ==="
+    - |
+      IMAGE_VERSIONS="site/tofu/image-versions.auto.tfvars"
+      if [[ ! -f "$IMAGE_VERSIONS" ]] || grep -q "Placeholder" "$IMAGE_VERSIONS" 2>/dev/null; then
+        echo "image-versions.auto.tfvars not available (validate stage runs before build)."
+        echo "Plan would show phantom drift for every VM. Skipping."
+        echo "Accurate plan runs in the deploy stage with real image versions."
+      else
+        framework/scripts/tofu-wrapper.sh plan -no-color
+      fi
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "prod"
+
+validate:provider-version:
+  stage: validate
+  tags: [infra]
+  script:
+    - echo "=== OpenTofu Init (provider ratchet) ==="
+    - framework/scripts/tofu-wrapper.sh init -input=false
+    - echo "=== Provider Version Ratchet ==="
+    - bash tests/test_proxmox_provider_version.sh
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "prod"
+
+validate:config:
+  stage: validate
+  tags: [infra]
+  script:
+    - echo "=== Config syntax check ==="
+    - yq e '.' site/config.yaml > /dev/null
+    - echo "Config YAML is valid"
+    - echo "=== Site config semantic validation ==="
+    - framework/scripts/validate-site-config.sh
+    - echo "=== Zone file syntax check ==="
+    - for f in site/dns/zones/*.yaml; do [ -f "$f" ] && yq e '.' "$f" > /dev/null; done || true
+    - echo "All zone files valid"
+    - echo "=== Vault requirements manifest syntax check ==="
+    - for f in framework/catalog/*/vault-requirements.yaml framework/tofu/modules/*/vault-requirements.yaml; do [ -f "$f" ] && yq e '.' "$f" > /dev/null; done || true
+    - echo "All vault requirements manifests valid"
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "prod"
+
+validate:approle-creds:
+  stage: validate
+  tags: [infra]
+  script:
+    - framework/scripts/check-approle-creds.sh
+  # Only on deploy pipelines — MR pipelines don't deploy, and new apps
+  # can't have credentials until after merge + onboarding from workstation.
+  rules:
+    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "prod"
+
+validate:source-filter:
+  stage: validate
+  tags: [infra]
+  script:
+    - framework/scripts/check-source-filter.sh
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "prod"
+
+validate:runner-concurrency-config:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_gitlab_runner_concurrency.sh
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "prod"
+
+validate:merge-image-versions:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_merge_image_versions.sh
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "prod"
+
+validate:nix-checks:
+  stage: validate
+  tags: [infra]
+  script:
+    - nix-instantiate --parse framework/nix/modules/base.nix
+    - nix-instantiate --parse framework/nix/modules/certbot.nix
+    - nix-instantiate --parse framework/nix/modules/gitlab-runner.nix
+    - nix build .#checks.x86_64-linux.source-filter --no-link
+    - nix build .#packages.x86_64-linux.influxdb-image --no-link
+    - nix build .#packages.x86_64-linux.grafana-image --no-link
+    - nix build .#packages.x86_64-linux.workstation-image --no-link
+    - nix eval .#nixosConfigurations.gitlab.config.system.build.toplevel.drvPath
+    - nix eval .#nixosConfigurations.cicd.config.system.build.toplevel.drvPath
+    - nix eval .#nixosConfigurations.dns_dev.config.system.build.toplevel.drvPath
+    - nix eval .#nixosConfigurations.testapp_dev.config.system.build.toplevel.drvPath
+    - nix eval .#nixosConfigurations.influxdb_dev.config.system.build.toplevel.drvPath
+    - nix eval .#nixosConfigurations.grafana_dev.config.system.build.toplevel.drvPath
+    - nix eval .#nixosConfigurations.workstation_dev.config.system.build.toplevel.drvPath
+    - nix eval .#nixosConfigurations.workstation_prod.config.system.build.toplevel.drvPath
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "prod"
+
+validate:shell-syntax:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash -n framework/scripts/backup-now.sh
+    - bash -n framework/scripts/build-all-images.sh
+    - bash -n framework/scripts/merge-image-versions.sh
+    - bash -n framework/scripts/check-control-plane-drift.sh
+    - bash -n framework/scripts/check-cert-budget.sh
+    - bash -n framework/scripts/check-approle-creds.sh
+    - bash -n framework/scripts/certbot-cluster.sh
+    - bash -n framework/scripts/certbot-initial-wrapper.sh
+    - bash -n framework/scripts/cert-storage-backfill.sh
+    - bash -n framework/scripts/cert-sync.sh
+    - bash -n framework/scripts/configure-vault.sh
+    - bash -n framework/scripts/converge-lib.sh
+    - bash -n framework/scripts/converge-vm.sh
+    - bash -n framework/scripts/deploy-control-plane.sh
+    - bash -n framework/scripts/deploy-workstation-closure.sh
+    - bash -n framework/scripts/configure-metrics.sh
+    - bash -n framework/scripts/configure-dashboard-tokens.sh
+    - bash -n framework/scripts/configure-sentinel-gatus.sh
+    - bash -n framework/scripts/generate-gatus-config.sh
+    - bash -n framework/scripts/github-publish-lib.sh
+    - bash -n framework/scripts/publish-filter.sh
+    - bash -n framework/scripts/publish-to-github.sh
+    - bash -n framework/scripts/seed-github-deploy-key.sh
+    - bash -n framework/scripts/rebuild-cluster.sh
+    - bash -n framework/scripts/register-runner.sh
+    - bash -n framework/scripts/restore-before-start.sh
+    - bash -n framework/scripts/confirm-empty-vdb-first-deploy.sh
+    - bash -n framework/scripts/list-backup-backed-vmids.sh
+    - bash -n framework/scripts/restore-from-pbs.sh
+    - bash -n framework/scripts/safe-apply.sh
+    - bash -n framework/scripts/sync-to-main.sh
+    - bash -n framework/scripts/tofu-wrapper.sh
+    - bash -n framework/scripts/validate-site-config.sh
+    - bash -n framework/scripts/validate.sh
+    - bash -n framework/scripts/validate-github-mirror.sh
+    - bash -n framework/scripts/verify-github-publish.sh
+    - bash -n framework/scripts/vault-requirements-lib.sh
+    - bash -n framework/scripts/vdb-state-lib.sh
+    - bash -n framework/scripts/vm-health-lib.sh
+    - bash -n tests/test_approle_onboarding.sh
+    - bash -n tests/test_backup_pin_file.sh
+    - bash -n tests/test_cert_budget_vault.sh
+    - bash -n tests/test_cert_storage_policy.sh
+    - bash -n tests/test_cert_storage_backfill_idempotency.sh
+    - bash -n tests/test_configure_sentinel_gatus_resilience.sh
+    - bash -n tests/test_configure_sentinel_gatus_deploy.sh
+    - bash -n tests/test_cert_restore_renewal_conf.sh
+    - bash -n tests/test_cert_sync_script.sh
+    - bash -n tests/test_certbot_initial_backoff.sh
+    - bash -n tests/test_closure_paths_artifact.sh
+    - bash -n tests/test_closure_drift_check.sh
+    - bash -n tests/test_deploy_control_plane.sh
+    - bash -n tests/test_converge_vm_interface.sh
+    - bash -n tests/test_converge_sprint_029_steps.sh
+    - bash -n tests/test_convergence_parity.sh
+    - bash -n tests/test_gitlab_ci_control_plane_stages.sh
+    - bash -n tests/test_gitlab_runner_concurrency.sh
+    - bash -n tests/test_merge_image_versions.sh
+    - bash -n tests/test_overlay_root_config.sh
+    - bash -n tests/test_converge_closure_step.sh
+    - bash -n tests/test_field_updatable_config.sh
+    - bash -n tests/lib/preboot_restore_fixture.sh
+    - bash -n tests/test_preboot_tofu_contract.sh
+    - bash -n tests/test_restore_before_start.sh
+    - bash -n tests/test_list_backup_backed_vmids.sh
+    - bash -n tests/test_restore_from_pbs_leave_stopped.sh
+    - bash -n tests/test_restore_from_pbs_backup_id.sh
+    - bash -n tests/test_manifest_derivation_invariant.sh
+    - bash -n tests/test_safe_apply_preboot_restore.sh
+    - bash -n tests/test_no_double_restore_after_phase_2.sh
+    - bash -n tests/test_safe_apply_recovery.sh
+    - bash -n tests/test_tofu_image_validation.sh
+    - bash -n tests/test_vm_health_lib.sh
+    - bash -n tests/test_grub_fixup_shared.sh
+    - bash -n tests/test_generation_cleanup.sh
+    - bash -n tests/test_field_updatable_flag.sh
+    - bash -n tests/test_metrics_dual_target.sh
+    - bash -n tests/test_dashboard_serving.sh
+    - bash -n tests/test_dashboard_secret_plumbing.sh
+    - bash -n tests/test_grafana_dashboard_provisioning.sh
+    - bash -n tests/test_ssh_host_key_restore.sh
+    - bash -n tests/test_operations_md_runbooks.sh
+    - bash -n tests/test_pipeline_post_deploy_status.sh
+    - bash -n tests/test_publish_failure_classification.sh
+    - bash -n tests/test_github_deploy_key_seed.sh
+    - bash -n tests/test_configure_vault_github_seed.sh
+    - bash -n tests/test_verify_github_publish.sh
+    - bash -n tests/test_github_remote_config.sh
+    - bash -n tests/test_publish_github_opt_in.sh
+    - bash -n tests/test_tofu_github_remote_plumbing.sh
+    - bash -n tests/test_gatus_github_mirror.sh
+    - bash -n tests/test_validate_github_mirror.sh
+    - bash -n tests/test_rebuild_pbs_install_before_preboot_restore.sh
+    - bash -n tests/test_rebuild_preboot_restore.sh
+    - bash -n tests/test_rebuild_restore_pin_file.sh
+    - bash -n tests/test_vdb_gate_removed.sh
+    - bash -n tests/test_nix_arg_glue_antipattern.sh
+    - bash -n tests/test_failure_injection_pbs_unreachable.sh
+    - bash -n tests/test_failure_injection_qmrestore_fails.sh
+    - bash -n tests/test_failure_injection_dd_errors.sh
+    - bash -n tests/test_failure_injection_malformed_manifest.sh
+    - bash -n tests/test_failure_injection_missing_backup.sh
+    - bash -n tests/test_publish_filter.sh
+    - bash -n tests/test_publish_to_github_oid_parser.sh
+    - bash -n tests/test_sprint_028_revert_baseline.sh
+    - bash -n tests/test_vm_pool_tags.sh
+    - bash -n tests/test_workstation_module.sh
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "prod"
+
+validate:publish-filter:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_publish_filter.sh
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "prod"
+
+validate:publish-failure-classification:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_publish_failure_classification.sh
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "prod"
+
+validate:publish-github-opt-in:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_publish_github_opt_in.sh
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "prod"
+
+# Issue #297: regression for the publish-to-github oid parser. Locks in
+# that ls-remote stderr capture (e.g., SSH "Warning: Permanently added")
+# is rejected before reaching git push --force-with-lease.
+validate:publish-to-github-oid-parser:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_publish_to_github_oid_parser.sh
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "prod"
+
+# Ratchets that the publish-test harnesses remain hermetic against the
+# per-run GITHUB_PUBLISH_ALLOW_INITIAL_REWRITE variable. The first prod-publish
+# run sets that variable pipeline-wide; if a future change drops the unset
+# from the test scripts, this job would fail by re-exhibiting the pipeline 845
+# leakage signature.
+validate:publish-tests-env-isolation:
+  stage: validate
+  tags: [infra]
+  variables:
+    GITHUB_PUBLISH_ALLOW_INITIAL_REWRITE: "1"
+  script:
+    - bash tests/test_publish_failure_classification.sh
+    - bash tests/test_publish_filter.sh
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "prod"
+
+validate:github-deploy-key-seed:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_github_deploy_key_seed.sh
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "prod"
+
+validate:configure-vault-github-seed:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_configure_vault_github_seed.sh
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "prod"
+
+validate:verify-github-publish:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_verify_github_publish.sh
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "prod"
+
+validate:github-remote-config:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_github_remote_config.sh
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "prod"
+
+validate:tofu-github-remote-plumbing:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_tofu_github_remote_plumbing.sh
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "prod"
+
+validate:gatus-github-mirror:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_gatus_github_mirror.sh
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "prod"
+
+validate:github-mirror-drift:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_validate_github_mirror.sh
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "prod"
+
+validate:dashboard-serving:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_dashboard_serving.sh
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "prod"
+
+validate:dashboard-secret-plumbing:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_dashboard_secret_plumbing.sh
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "prod"
+
+validate:approle-onboarding:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_approle_onboarding.sh
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "prod"
+
+validate:cert-storage-policy:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_cert_storage_policy.sh
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "prod"
+
+validate:cert-storage-backfill-idempotency:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_cert_storage_backfill_idempotency.sh
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "prod"
+
+validate:configure-sentinel-gatus-resilience:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_configure_sentinel_gatus_resilience.sh
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "prod"
+
+validate:configure-sentinel-gatus-deploy:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_configure_sentinel_gatus_deploy.sh
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "prod"
+
+validate:cert-restore-renewal-conf:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_cert_restore_renewal_conf.sh
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "prod"
+
+validate:cert-sync-script:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_cert_sync_script.sh
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "prod"
+
+validate:certbot-backoff:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_certbot_initial_backoff.sh
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "prod"
+
+validate:cert-budget:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_cert_budget_vault.sh
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "prod"
+
+validate:grafana-dashboard-provisioning:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_grafana_dashboard_provisioning.sh
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "prod"
+
+validate:rebuild-branch-guard:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_rebuild_branch_guard.sh
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "prod"
+
+validate:safe-apply-ha-flow:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_safe_apply_ha_flow.sh
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "prod"
+
+validate:safe-apply-recovery:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_safe_apply_recovery.sh
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "prod"
+
+validate:rebuild-ha-flow:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_rebuild_ha_flow.sh
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "prod"
+
+validate:converge-vm-interface:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_converge_vm_interface.sh
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "prod"
+
+validate:converge-vm-scope:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_converge_vm_scope.sh
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "prod"
+
+validate:converge-sprint-029-steps:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_converge_sprint_029_steps.sh
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "prod"
+
+validate:convergence-parity:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_convergence_parity.sh
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "prod"
+
+validate:certbot-override-scope:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_rebuild_staging_override.sh
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "prod"
+
+validate:certbot-persisted-state:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_certbot_persisted_state.sh
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "prod"
+
+validate:certbot-cluster-failure-modes:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_certbot_cluster_failure_modes.sh
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "prod"
+
+validate:overlay-root-config:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_overlay_root_config.sh
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "prod"
+
+validate:converge-closure-step:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_converge_closure_step.sh
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "prod"
+
+validate:field-updatable-config:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_field_updatable_config.sh
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "prod"
+
+validate:closure-drift-check:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_closure_drift_check.sh
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "prod"
+
+validate:closure-paths-artifact:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_closure_paths_artifact.sh
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "prod"
+
+validate:deploy-control-plane-logic:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_deploy_control_plane.sh
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "prod"
+
+validate:gitlab-ci-control-plane-stages:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_gitlab_ci_control_plane_stages.sh
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "prod"
+
+validate:vm-health-lib:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_vm_health_lib.sh
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "prod"
+
+validate:backup-pin-file:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_backup_pin_file.sh
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "prod"
+
+validate:restore-before-start:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_restore_before_start.sh
+    - bash tests/test_list_backup_backed_vmids.sh
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "prod"
+
+validate:restore-from-pbs-leave-stopped:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_restore_from_pbs_leave_stopped.sh
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "prod"
+
+validate:restore-from-pbs-backup-id:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_restore_from_pbs_backup_id.sh
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "prod"
+
+validate:preboot-tofu-contract:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_preboot_tofu_contract.sh
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "prod"
+
+validate:manifest-invariant:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_manifest_derivation_invariant.sh
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "prod"
+
+validate:safe-apply-preboot-restore:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_safe_apply_preboot_restore.sh
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "prod"
+
+validate:no-double-restore:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_no_double_restore_after_phase_2.sh
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "prod"
+
+validate:rebuild-preboot-restore:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_rebuild_pbs_install_before_preboot_restore.sh
+    - bash tests/test_rebuild_preboot_restore.sh
+    - bash tests/test_rebuild_restore_pin_file.sh
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "prod"
+
+validate:vdb-gate-removed:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_vdb_gate_removed.sh
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "prod"
+
+validate:nix-arg-glue-antipattern:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_nix_arg_glue_antipattern.sh
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "prod"
+
+validate:failure-injection-pbs:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_failure_injection_pbs_unreachable.sh
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "prod"
+
+validate:failure-injection-qmrestore:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_failure_injection_qmrestore_fails.sh
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "prod"
+
+validate:failure-injection-dd:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_failure_injection_dd_errors.sh
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "prod"
+
+validate:failure-injection-manifest:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_failure_injection_malformed_manifest.sh
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "prod"
+
+validate:failure-injection-missing-backup:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_failure_injection_missing_backup.sh
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "prod"
+
+validate:tofu-image-validation:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_tofu_image_validation.sh
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "prod"
+
+
+validate:grub-fixup-shared:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_grub_fixup_shared.sh
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "prod"
+
+validate:generation-cleanup:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_generation_cleanup.sh
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "prod"
+
+validate:metrics-dual-target:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_metrics_dual_target.sh
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "prod"
+
+validate:field-updatable-flag:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_field_updatable_flag.sh
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "prod"
+
+validate:ssh-host-key-restore:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_ssh_host_key_restore.sh
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "prod"
+
+validate:operations-runbooks:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_operations_md_runbooks.sh
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "prod"
+
+validate:post-deploy-status:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_pipeline_post_deploy_status.sh
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "prod"
+
+validate:vm-pool-tags:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_vm_pool_tags.sh
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "prod"
+
+validate:workstation-module:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_workstation_module.sh
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "prod"
+
+validate:sprint-028-revert-baseline:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_sprint_028_revert_baseline.sh
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "prod"
+
+validate:cert-wait-env-scope:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_validate_cert_wait_scope.sh
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "prod"
+
+validate:static-disk-size-no-null:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_static_disk_size_no_null.sh
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "prod"
+
+# --- Build ---
+
+# Per-role image builds run in parallel — runner concurrent=8 (Sprint 030 C001)
+# lets up to 8 of these execute simultaneously. Sprint 030 C002 fan-out.
+#
+# IMPORTANT: the matrix list is the source of truth for which roles the
+# pipeline builds in parallel. It MUST stay in sync with the union of
+# framework/images.yaml, site/images.yaml, and enabled apps in
+# site/applications.yaml. merge-image-versions.sh fails loudly on drift
+# (missing or unexpected fragments) — that catches forgotten updates.
+#
+# NOTE: this matrix assumes every role has category: nix. If a role with
+# category: external is added to a manifest, the per-role job will fail
+# (build-image.sh will look for a missing .nix file) — extend the script
+# below to read the manifest's category field and dispatch to
+# build-image.sh --external when needed. No current role uses Category B,
+# so the dispatch is deferred until the first one lands.
+build:image:
+  stage: build
+  tags: [infra]
+  variables:
+    # 8 parallel jobs × 4 cores each = 32 thread budget on a 12-vCPU runner.
+    # Mild oversubscription is fine; nix builds are partially I/O-bound.
+    NIX_BUILD_CORES: "4"
+  parallel:
+    matrix:
+      - ROLE:
+          - dns
+          - vault
+          - gitlab
+          - cicd
+          - acme-dev
+          - gatus
+          - testapp
+          - influxdb
+          - grafana
+          - roon
+  script:
+    - echo "=== Building ${ROLE} ==="
+    - HOST_CONFIG="site/nix/hosts/${ROLE}.nix"
+    - framework/scripts/build-image.sh "$HOST_CONFIG" "$ROLE"
+    - mkdir -p build/image-versions
+    - grep -E "^[[:space:]]*\"${ROLE}\"[[:space:]]*=" site/tofu/image-versions.auto.tfvars > "build/image-versions/${ROLE}.tfvars-fragment"
+    - cat "build/image-versions/${ROLE}.tfvars-fragment"
+    - |
+      if [ "$ROLE" = "gitlab" ] || [ "$ROLE" = "cicd" ]; then
+        echo "=== Building system closure: ${ROLE} ==="
+        nix build --print-out-paths \
+          --out-link "build/closure-${ROLE}" \
+          ".#nixosConfigurations.${ROLE}.config.system.build.toplevel" \
+          > "build/closure-path-${ROLE}.txt"
+        cat "build/closure-path-${ROLE}.txt"
+      fi
+  artifacts:
+    paths:
+      - build/image-versions/
+      - build/closure-gitlab
+      - build/closure-cicd
+      - build/closure-path-gitlab.txt
+      - build/closure-path-cicd.txt
+    expire_in: 1 hour
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "prod"
+
+build:merge:
+  stage: build
+  tags: [infra]
+  needs:
+    - job: "build:image"
+      artifacts: true
+  script:
+    - echo "=== Merging per-role image fragments ==="
+    - framework/scripts/merge-image-versions.sh
+    - echo "=== Generating Gatus config ==="
+    - mkdir -p site/gatus
+    - GATUS_GITHUB_EXPECTED_SOURCE_COMMIT="${CI_COMMIT_SHA:-}" framework/scripts/generate-gatus-config.sh > site/gatus/config.yaml
+  artifacts:
+    paths:
+      - build/closure-paths.json
+      - build/closure-gitlab
+      - build/closure-cicd
+      - site/tofu/image-versions.auto.tfvars
+      - site/gatus/config.yaml
+    expire_in: 1 hour
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "prod"
+
+# --- Deploy Dev ---
+
+deploy:dev:
+  stage: deploy-dev
+  tags: [infra]
+  dependencies:
+    - build:merge
+  variables:
+    PIN_FILE: "build/restore-pin-dev.json"
+  script:
+    - echo "=== Pre-deploy backup ==="
+    - |
+      FIRST_NODE=$(yq -r '.nodes[0].mgmt_ip' site/config.yaml)
+      PBS_REGISTERED=$(ssh -n -o ConnectTimeout=5 -o StrictHostKeyChecking=no -o BatchMode=yes \
+        "root@${FIRST_NODE}" "pvesm status 2>/dev/null | grep -c pbs-nas" 2>/dev/null || echo "0")
+      if framework/scripts/backup-now.sh --env dev --pin-out "$PIN_FILE"; then
+        echo "Pre-deploy backup complete"
+      elif [[ "$PBS_REGISTERED" -gt 0 ]]; then
+        echo "FATAL: PBS is configured but backup failed. Refusing to deploy." >&2
+        echo "Fix the backup failure before deploying." >&2
+        exit 1
+      else
+        echo "WARNING: PBS not yet configured — skipping pre-deploy backup"
+        echo "This is expected on first deploy."
+      fi
+    - echo "=== Deploying to dev ==="
+    - framework/scripts/tofu-wrapper.sh init -input=false
+    - framework/scripts/ensure-app-secrets.sh
+    # safe-apply.sh runs stopped apply -> restore-before-start -> start apply,
+    # then post-success convergence. Phase 1 failures use
+    # restore-before-start --recovery-mode (#224).
+    - framework/scripts/safe-apply.sh dev
+    - echo "=== Deploying workstation dev closure ==="
+    - framework/scripts/deploy-workstation-closure.sh dev
+  artifacts:
+    when: always
+    name: "deploy-dev-$CI_JOB_ID"
+    paths:
+      - build/restore-pin-dev.json
+      - build/preboot-restore-*.json
+      - build/preboot-restore-status-*.json
+      - build/first-deploy-allow-*.json
+    expire_in: 1 month
+  rules:
+    - if: $CI_COMMIT_BRANCH == "dev"
+
+# --- Deploy Control Plane Dev ---
+
+deploy:control-plane:gitlab:dev:
+  stage: deploy-control-plane-dev
+  tags: [infra]
+  dependencies:
+    - build:merge
+  script:
+    - echo "=== Deploying control-plane closure to gitlab (dev pipeline) ==="
+    - framework/scripts/deploy-control-plane.sh dev gitlab
+  rules:
+    - if: $CI_COMMIT_BRANCH == "dev"
+
+deploy:control-plane:cicd:dev:
+  stage: deploy-control-plane-dev
+  tags: [infra]
+  needs:
+    - job: "deploy:control-plane:gitlab:dev"
+      artifacts: false
+    - job: "build:merge"
+      artifacts: true
+  script:
+    - echo "=== Deploying control-plane closure to cicd (dev pipeline) ==="
+    - framework/scripts/deploy-control-plane.sh dev cicd
+  retry:
+    max: 2
+    when:
+      - runner_system_failure
+      - stuck_or_timeout_failure
+      - job_execution_timeout
+  rules:
+    - if: $CI_COMMIT_BRANCH == "dev"
+
+# --- Test Dev ---
+
+test:dev:
+  stage: test-dev
+  tags: [infra]
+  script:
+    - echo "=== Validating dev deployment ==="
+    - framework/scripts/validate.sh --regression-safe dev
+  rules:
+    - if: $CI_COMMIT_BRANCH == "dev"
+
+regression:
+  stage: test-dev
+  tags: [infra]
+  script:
+    - echo "=== Full regression suite ==="
+    - framework/scripts/validate.sh --regression dev
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+
+# --- Deploy Prod ---
+
+deploy:prod:
+  stage: deploy-prod
+  tags: [infra]
+  dependencies:
+    - build:merge
+  variables:
+    PIN_FILE: "build/restore-pin-prod.json"
+  script:
+    - echo "=== Pre-deploy backup ==="
+    - |
+      FIRST_NODE=$(yq -r '.nodes[0].mgmt_ip' site/config.yaml)
+      PBS_REGISTERED=$(ssh -n -o ConnectTimeout=5 -o StrictHostKeyChecking=no -o BatchMode=yes \
+        "root@${FIRST_NODE}" "pvesm status 2>/dev/null | grep -c pbs-nas" 2>/dev/null || echo "0")
+      if framework/scripts/backup-now.sh --env prod --pin-out "$PIN_FILE"; then
+        echo "Pre-deploy backup complete"
+      elif [[ "$PBS_REGISTERED" -gt 0 ]]; then
+        echo "FATAL: PBS is configured but backup failed. Refusing to deploy." >&2
+        echo "Fix the backup failure before deploying." >&2
+        exit 1
+      else
+        echo "WARNING: PBS not yet configured — skipping pre-deploy backup"
+        echo "This is expected on first deploy."
+      fi
+    - echo "=== Cert budget preflight ==="
+    - framework/scripts/check-cert-budget.sh prod
+    - echo "=== Deploying to prod ==="
+    - framework/scripts/tofu-wrapper.sh init -input=false
+    - framework/scripts/ensure-app-secrets.sh
+    # safe-apply.sh runs stopped apply -> restore-before-start -> start apply,
+    # then post-success convergence. Phase 1 failures use
+    # restore-before-start --recovery-mode (#224).
+    - framework/scripts/safe-apply.sh prod
+    - echo "=== Deploying workstation prod closure ==="
+    - framework/scripts/deploy-workstation-closure.sh prod
+  artifacts:
+    when: always
+    name: "deploy-prod-$CI_JOB_ID"
+    paths:
+      - build/restore-pin-prod.json
+      - build/preboot-restore-*.json
+      - build/preboot-restore-status-*.json
+      - build/first-deploy-allow-*.json
+    expire_in: 1 month
+  rules:
+    - if: $CI_COMMIT_BRANCH == "prod"
+
+# --- Deploy Control Plane Prod ---
+
+deploy:control-plane:gitlab:prod:
+  stage: deploy-control-plane-prod
+  tags: [infra]
+  dependencies:
+    - build:merge
+  script:
+    - echo "=== Deploying control-plane closure to gitlab (prod pipeline) ==="
+    - framework/scripts/deploy-control-plane.sh prod gitlab
+  rules:
+    - if: $CI_COMMIT_BRANCH == "prod"
+
+deploy:control-plane:cicd:prod:
+  stage: deploy-control-plane-prod
+  tags: [infra]
+  needs:
+    - job: "deploy:control-plane:gitlab:prod"
+      artifacts: false
+    - job: "build:merge"
+      artifacts: true
+  script:
+    - echo "=== Deploying control-plane closure to cicd (prod pipeline) ==="
+    - framework/scripts/deploy-control-plane.sh prod cicd
+  retry:
+    max: 2
+    when:
+      - runner_system_failure
+      - stuck_or_timeout_failure
+      - job_execution_timeout
+  rules:
+    - if: $CI_COMMIT_BRANCH == "prod"
+
+# --- Test Prod ---
+
+test:prod:
+  stage: test-prod
+  tags: [infra]
+  script:
+    - echo "=== Validating prod deployment ==="
+    - framework/scripts/validate.sh --regression-safe prod
+  rules:
+    - if: $CI_COMMIT_BRANCH == "prod"
+
+publish:github:
+  stage: publish-github
+  tags: [infra]
+  script:
+    - |
+      # Gate on publish.github.enabled in site/config.yaml. We cannot use a
+      # rule like `$PUBLISH_GITHUB_ENABLED == "true"` because GitLab evaluates
+      # rules at pipeline creation, before any prepare-stage job could populate
+      # a dotenv var. Reading config.yaml here keeps the gate inside the same
+      # source of truth that validate-site-config.sh enforces.
+      enabled=$(yq -r '.publish.github.enabled // false' site/config.yaml)
+      if [[ "${enabled}" != "true" ]]; then
+        echo "publish.github.enabled is not true; skipping publish:github." >&2
+        exit 0
+      fi
+    - echo "=== Publishing framework mirror to GitHub ==="
+    - framework/scripts/publish-to-github.sh
+  artifacts:
+    when: always
+    paths:
+      - build/github-publish-status.json
+    expire_in: 1 month
+  rules:
+    - if: $CI_COMMIT_BRANCH == "prod"
