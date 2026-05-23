@@ -1,0 +1,16 @@
+# Site image manifest — application roles specific to this deployment.
+#
+# Add site-specific VM roles here. Framework infrastructure roles are in
+# framework/images.yaml. Duplicate role names across manifests are an error.
+#
+# Examples:
+#   roles:
+#     postgres:
+#       category: nix
+#       host_config: site/nix/hosts/postgres.nix
+#       flake_output: postgres-image
+#     myapp:
+#       category: external
+#       build_script: site/images/myapp/build.sh
+
+roles: {}

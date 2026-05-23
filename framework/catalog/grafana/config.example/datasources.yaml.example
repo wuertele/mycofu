@@ -1,0 +1,29 @@
+# Grafana data source provisioning (REQUIRED)
+#
+# See: https://grafana.com/docs/grafana/latest/administration/provisioning/#data-sources
+#
+# IMPORTANT: Replace placeholder values below with your actual configuration.
+#
+# The InfluxDB URL uses the unqualified hostname 'influxdb'. In prod,
+# this resolves to the prod InfluxDB. In dev, to the dev InfluxDB.
+# This is the environment-ignorance pattern — same config works in all
+# environments without modification.
+#
+# The token uses Grafana's ${INFLUXDB_TOKEN} env var substitution.
+# The catalog module reads the token from SOPS and sets the env var.
+# Do NOT put the actual token in this file.
+
+apiVersion: 1
+
+datasources:
+  - name: InfluxDB
+    type: influxdb
+    access: proxy
+    url: https://influxdb:8086
+    jsonData:
+      version: Flux
+      organization: homelab
+      defaultBucket: default
+      tlsSkipVerify: true
+    secureJsonData:
+      token: ${INFLUXDB_TOKEN}

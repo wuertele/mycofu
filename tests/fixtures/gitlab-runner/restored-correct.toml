@@ -1,0 +1,8 @@
+concurrent = 8
+
+[[runners]]
+  name = "cicd"
+  url = "https://gitlab.example.invalid"
+  token = "glrt-redacted"
+  executor = "shell"
+  tag_list = ["infra", "deploy"]

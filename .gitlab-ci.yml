@@ -1,0 +1,2105 @@
+# .gitlab-ci.yml — Infrastructure CI/CD pipeline.
+#
+# Two-tier deployment model (architecture.md section 10.3):
+# Tier 1 (pipeline): Data-plane VMs — DNS, Vault, Pebble, Gatus, apps.
+# Tier 2 (workstation): Control-plane VMs — GitLab, CI/CD runner, PBS.
+# The pipeline builds ALL roles (verifies buildability) but only deploys
+# data-plane targets. Control-plane images are built and uploaded, ready
+# for the operator to activate from the workstation.
+#
+# Branch model (architecture.md section 13.3):
+# dev branch push  → build + upload + deploy-dev + test-dev
+# prod branch push → build + upload + deploy-prod + test-prod
+# MR (any target)  → validate + build (no deploy)
+# Other branches   → no pipeline
+#
+# Runner: shell executor with all infrastructure tools (nix, tofu, sops, etc.)
+# Secrets: SOPS age key at /run/secrets/sops/age-key on the runner VM.
+
+# Prevent duplicate pipelines: only run for MR events or dev/prod pushes.
+# Feature branch pushes without an MR produce no pipeline.
+include:
+  - local: tests/hil/.gitlab-ci-hil.yml
+    rules:
+      - exists:
+          - tests/hil/.gitlab-ci-hil.yml
+
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "web"
+      exists:
+        - tests/hil/.gitlab-ci-hil.yml
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+
+stages:
+  - validate
+  - build
+  - deploy-dev
+  - deploy-control-plane-dev
+  - converge-dev
+  - test-dev
+  - deploy-prod
+  - deploy-control-plane-prod
+  - converge-prod
+  - test-prod
+  - publish-github
+
+variables:
+  SOPS_AGE_KEY_FILE: /run/secrets/sops/age-key
+
+# --- Validate ---
+
+validate:plan:
+  stage: validate
+  tags: [infra]
+  script:
+    - echo "=== OpenTofu Init ==="
+    - framework/scripts/tofu-wrapper.sh init -input=false
+    - echo "=== OpenTofu Validate ==="
+    - framework/scripts/tofu-wrapper.sh validate
+    - echo "=== OpenTofu Plan ==="
+    - |
+      IMAGE_VERSIONS="site/tofu/image-versions.auto.tfvars"
+      if [[ ! -f "$IMAGE_VERSIONS" ]] || grep -q "Placeholder" "$IMAGE_VERSIONS" 2>/dev/null; then
+        echo "image-versions.auto.tfvars not available (validate stage runs before build)."
+        echo "Plan would show phantom drift for every VM. Skipping."
+        echo "Accurate plan runs in the deploy stage with real image versions."
+      else
+        framework/scripts/tofu-wrapper.sh plan -no-color
+      fi
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+validate:provider-version:
+  stage: validate
+  tags: [infra]
+  script:
+    - echo "=== OpenTofu Init (provider ratchet) ==="
+    - framework/scripts/tofu-wrapper.sh init -input=false
+    - echo "=== Provider Version Ratchet ==="
+    - bash tests/test_proxmox_provider_version.sh
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+validate:config:
+  stage: validate
+  tags: [infra]
+  script:
+    - echo "=== Config syntax check ==="
+    - yq e '.' site/config.yaml > /dev/null
+    - echo "Config YAML is valid"
+    - echo "=== Site config semantic validation ==="
+    - framework/scripts/validate-site-config.sh
+    - if [ -f tests/hil/.gitlab-ci-hil.yml ]; then bash tests/test_hil_boot_config_schema.sh; else echo "HIL config absent; skipping HIL schema checks"; fi
+    - echo "=== Zone file syntax check ==="
+    - for f in site/dns/zones/*.yaml; do [ -f "$f" ] && yq e '.' "$f" > /dev/null; done || true
+    - echo "All zone files valid"
+    - echo "=== Vault requirements manifest syntax check ==="
+    - for f in framework/catalog/*/vault-requirements.yaml framework/tofu/modules/*/vault-requirements.yaml; do [ -f "$f" ] && yq e '.' "$f" > /dev/null; done || true
+    - echo "All vault requirements manifests valid"
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+validate:approle-creds:
+  stage: validate
+  tags: [infra]
+  script:
+    - framework/scripts/check-approle-creds.sh
+  # Only on deploy pipelines — MR pipelines don't deploy, and new apps
+  # can't have credentials until after merge + onboarding from workstation.
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+validate:source-filter:
+  stage: validate
+  tags: [infra]
+  script:
+    - framework/scripts/check-source-filter.sh
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+validate:runner-concurrency-config:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_gitlab_runner_concurrency.sh
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+# Sovereignty regression: `tofu init` on the runner must NOT reach
+# registry.opentofu.org or github.com. The bpg/proxmox provider is
+# vendored via a Nix-built filesystem_mirror (see
+# framework/nix/lib/bpg-proxmox-provider.nix). The test builds the
+# provider derivation itself via `nix build`, so this job is
+# self-contained and does not depend on the cicd image having been
+# rebuilt with the new TF_CLI_CONFIG_FILE env. It points HTTPS_PROXY
+# at a dead address and runs `tofu init` with both -upgrade=false
+# and -upgrade=true to verify both code paths stay offline.
+validate:sovereign-tofu-init:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_sovereign_tofu_init.sh
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+# Drift guard: the bpg/proxmox version must stay consistent across
+# the vendored Nix derivation, versions.tf, and .terraform.lock.hcl.
+# A future bump that updates only some of them would fail tofu init
+# in a confusing way; this test catches drift early.
+validate:bpg-proxmox-version-drift:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_bpg_proxmox_version_drift.sh
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+# Exercises bucket-reconcile.sh against a Python mock InfluxDB API:
+# create/update/idempotency/no-delete/retention parsing/401/count guardrail.
+validate:influxdb-bucket-reconcile:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_influxdb_bucket_reconcile.sh
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+validate:merge-image-versions:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_merge_image_versions.sh
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+validate:configure-node-kernel:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_configure_node_kernel.sh
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+validate:repl-watchdog-uses-ifup:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_repl_watchdog_uses_ifup.sh
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+validate:nix-checks:
+  stage: validate
+  tags: [infra]
+  script:
+    - nix-instantiate --parse framework/nix/modules/base.nix
+    - nix-instantiate --parse framework/nix/modules/certbot.nix
+    - nix-instantiate --parse framework/nix/modules/gitlab-runner.nix
+    - if [ -f tests/hil/.gitlab-ci-hil.yml ]; then nix-instantiate --parse framework/nix/modules/hil-boot-host.nix; fi
+    - if [ -f tests/hil/.gitlab-ci-hil.yml ]; then nix-instantiate --parse framework/nix/pkgs/paia/default.nix; fi
+    - if [ -f tests/hil/.gitlab-ci-hil.yml ]; then nix-instantiate --parse site/nix/lib/hil-boot-artifacts.nix; fi
+    - nix build .#checks.x86_64-linux.source-filter --no-link
+    - nix build .#packages.x86_64-linux.influxdb-image --no-link
+    - nix build .#packages.x86_64-linux.grafana-image --no-link
+    - nix build .#packages.x86_64-linux.workstation-image --no-link
+    - nix eval .#nixosConfigurations.gitlab.config.system.build.toplevel.drvPath
+    - if [ -f tests/hil/.gitlab-ci-hil.yml ]; then nix eval --impure .#nixosConfigurations.hil_boot.config.system.build.toplevel.drvPath; fi
+    - nix eval .#nixosConfigurations.cicd.config.system.build.toplevel.drvPath
+    - nix eval .#nixosConfigurations.dns_dev.config.system.build.toplevel.drvPath
+    - nix eval .#nixosConfigurations.testapp_dev.config.system.build.toplevel.drvPath
+    - nix eval .#nixosConfigurations.influxdb_dev.config.system.build.toplevel.drvPath
+    - nix eval .#nixosConfigurations.grafana_dev.config.system.build.toplevel.drvPath
+    - nix eval .#nixosConfigurations.workstation_dev.config.system.build.toplevel.drvPath
+    - nix eval .#nixosConfigurations.workstation_prod.config.system.build.toplevel.drvPath
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+validate:shell-syntax:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash -n framework/scripts/backup-now.sh
+    - bash -n framework/scripts/bootstrap-sops.sh
+    - bash -n framework/scripts/build-all-images.sh
+    - bash -n framework/scripts/merge-image-versions.sh
+    - bash -n framework/scripts/check-control-plane-drift.sh
+    - bash -n framework/scripts/check-cert-budget.sh
+    - bash -n framework/scripts/check-approle-creds.sh
+    - bash -n framework/scripts/certbot-cluster.sh
+    - bash -n framework/scripts/certbot-initial-wrapper.sh
+    - bash -n framework/scripts/cert-storage-backfill.sh
+    - bash -n framework/scripts/cert-sync.sh
+    - bash -n framework/scripts/configure-vault.sh
+    - bash -n framework/scripts/converge-cluster.sh
+    - bash -n framework/scripts/converge-lib.sh
+    - bash -n framework/scripts/converge-vm.sh
+    - bash -n framework/scripts/deploy-control-plane.sh
+    - bash -n framework/scripts/deploy-workstation-closure.sh
+    - bash -n framework/scripts/configure-metrics.sh
+    - bash -n framework/scripts/configure-dashboard-tokens.sh
+    - bash -n framework/scripts/configure-node-kernel.sh
+    - bash -n framework/scripts/configure-sentinel-gatus.sh
+    - bash -n framework/scripts/generate-gatus-config.sh
+    - bash -n framework/scripts/github-publish-lib.sh
+    - bash -n framework/scripts/install-pve-node.sh
+    - bash -n framework/scripts/new-site.sh
+    - bash -n framework/scripts/pdu-cycle.sh
+    - if command -v expect >/dev/null 2>&1; then expect -f framework/scripts/pdu-cycle.exp --syntax-check; else echo "expect not installed on runner; skipping pdu-cycle.exp syntax check"; fi
+    - bash -n framework/scripts/publish-filter.sh
+    - bash -n framework/scripts/publish-to-github.sh
+    - bash -n framework/scripts/regreen-cluster.sh
+    - bash -n framework/scripts/remaster-pve-installer.sh
+    - bash -n framework/scripts/seed-github-deploy-key.sh
+    - bash -n framework/scripts/rebuild-cluster.sh
+    - bash -n framework/scripts/register-runner.sh
+    - bash -n framework/scripts/restore-before-start.sh
+    - bash -n framework/scripts/confirm-empty-vdb-first-deploy.sh
+    - bash -n framework/scripts/list-backup-backed-vmids.sh
+    - bash -n framework/scripts/reboot-node-rolling.sh
+    - bash -n framework/scripts/restore-from-pbs.sh
+    - bash -n framework/scripts/rolling-reboot-node-inner.sh
+    - bash -n framework/scripts/safe-apply.sh
+    - bash -n framework/scripts/sync-to-main.sh
+    - bash -n framework/scripts/tofu-wrapper.sh
+    - bash -n framework/scripts/validate-site-config.sh
+    - bash -n framework/scripts/validate.sh
+    - bash -n framework/scripts/validate-github-mirror.sh
+    - bash -n framework/scripts/verify-github-publish.sh
+    - bash -n framework/scripts/vault-requirements-lib.sh
+    - bash -n framework/scripts/vdb-state-lib.sh
+    - bash -n framework/scripts/vm-health-lib.sh
+    - bash -n benchmarks/lib/runner-contention.sh
+    - bash -n benchmarks/lib/gitlab-api.sh
+    - bash -n benchmarks/lib/scheduled-status.sh
+    - bash -n benchmarks/run-scheduled-bench.sh
+    - bash -n benchmarks/run-on-host.sh
+    - bash -n benchmarks/run-baseline.sh
+    - bash -n tests/test_sovereign_tofu_init.sh
+    - bash -n tests/test_bpg_proxmox_version_drift.sh
+    - bash -n tests/test_bench_scheduled_ci_dispatch.sh
+    - bash -n tests/test_run_on_host_trigger_propagation.sh
+    - bash -n tests/test_run_on_host_unattended.sh
+    - bash -n tests/test_run_scheduled_bench.sh
+    - bash -n tests/test_run_scheduled_bench_sigterm_cleanup.sh
+    - bash -n tests/test_bench_scheduled_status_metrics.sh
+    - bash -n tests/test_benchmark_scheduled_docs.sh
+    - bash -n tests/test_approle_onboarding.sh
+    - bash -n tests/test_backup_pin_file.sh
+    - bash -n tests/test_cert_budget_vault.sh
+    - bash -n tests/test_cert_storage_policy.sh
+    - bash -n tests/test_cert_storage_backfill_idempotency.sh
+    - bash -n tests/test_configure_sentinel_gatus_resilience.sh
+    - bash -n tests/test_configure_sentinel_gatus_deploy.sh
+    - bash -n tests/test_cert_restore_renewal_conf.sh
+    - bash -n tests/test_cert_sync_script.sh
+    - bash -n tests/test_certbot_initial_backoff.sh
+    - bash -n tests/test_closure_paths_artifact.sh
+    - bash -n tests/test_closure_drift_check.sh
+    - bash -n tests/test_deploy_control_plane.sh
+    - bash -n tests/test_converge_vm_interface.sh
+    - bash -n tests/test_converge_sprint_029_steps.sh
+    - bash -n tests/test_convergence_parity.sh
+    - bash -n tests/test_gitlab_ci_control_plane_stages.sh
+    - bash -n tests/test_gitlab_runner_concurrency.sh
+    - bash -n tests/test_merge_image_versions.sh
+    - bash -n tests/test_meshcmd_packaging.sh
+    - bash -n tests/test_meshcmd_source_filter.sh
+    - bash -n tests/test_overlay_root_config.sh
+    - bash -n tests/test_converge_closure_step.sh
+    - bash -n tests/test_field_updatable_config.sh
+    - bash -n tests/lib/preboot_restore_fixture.sh
+    - bash -n tests/test_preboot_tofu_contract.sh
+    - bash -n tests/test_restore_before_start.sh
+    - bash -n tests/test_list_backup_backed_vmids.sh
+    - bash -n tests/test_restore_from_pbs_leave_stopped.sh
+    - bash -n tests/test_restore_from_pbs_backup_id.sh
+    - bash -n tests/test_manifest_derivation_invariant.sh
+    - bash -n tests/test_safe_apply_preboot_restore.sh
+    - bash -n tests/test_no_double_restore_after_phase_2.sh
+    - bash -n tests/test_safe_apply_recovery.sh
+    - bash -n tests/test_tofu_image_validation.sh
+    - bash -n tests/test_vm_health_lib.sh
+    - bash -n tests/test_grub_fixup_shared.sh
+    - bash -n tests/test_generation_cleanup.sh
+    - bash -n tests/test_field_updatable_flag.sh
+    - bash -n tests/test_metrics_dual_target.sh
+    - bash -n tests/test_dashboard_serving.sh
+    - bash -n tests/test_dashboard_secret_plumbing.sh
+    - bash -n tests/test_grafana_dashboard_provisioning.sh
+    - bash -n tests/test_ssh_host_key_restore.sh
+    - bash -n tests/test_operations_md_runbooks.sh
+    - bash -n tests/test_pipeline_post_deploy_status.sh
+    - bash -n tests/test_publish_failure_classification.sh
+    - bash -n tests/test_github_deploy_key_seed.sh
+    - bash -n tests/test_configure_vault_github_seed.sh
+    - bash -n tests/test_verify_github_publish.sh
+    - bash -n tests/test_github_remote_config.sh
+    - bash -n tests/test_publish_github_opt_in.sh
+    - bash -n tests/test_tofu_github_remote_plumbing.sh
+    - bash -n tests/test_gatus_github_mirror.sh
+    - bash -n tests/test_validate_github_mirror.sh
+    - bash -n tests/test_rebuild_pbs_install_before_preboot_restore.sh
+    - bash -n tests/test_rebuild_preboot_restore.sh
+    - bash -n tests/test_rebuild_restore_pin_file.sh
+    - bash -n tests/test_rebuild_known_hosts_scope.sh
+    - bash -n tests/test_converge_cluster.sh
+    - bash -n tests/test_reset_cluster_preserves_snippets.sh
+    - bash -n tests/test_rolling_reboot_node.sh
+    - bash -n tests/test_vdb_gate_removed.sh
+    - bash -n tests/test_nix_arg_glue_antipattern.sh
+    - bash -n tests/test_failure_injection_pbs_unreachable.sh
+    - bash -n tests/test_failure_injection_qmrestore_fails.sh
+    - bash -n tests/test_failure_injection_dd_errors.sh
+    - bash -n tests/test_failure_injection_malformed_manifest.sh
+    - bash -n tests/test_failure_injection_missing_backup.sh
+    - bash -n tests/test_publish_filter.sh
+    - bash -n tests/test_publish_filter_hil_excluded.sh
+    - bash -n tests/test_publish_to_github_oid_parser.sh
+    - bash -n tests/test_sprint_028_revert_baseline.sh
+    - bash -n tests/test_vm_pool_tags.sh
+    - bash -n tests/test_workstation_module.sh
+    - bash -n tests/test_regreener_config_schema.sh
+    - bash -n tests/test_regreener_docs.sh
+    - bash -n tests/test_regreener_host_module.sh
+    - bash -n tests/test_regreener_no_site_hardcoding.sh
+    - bash -n tests/test_paia_packaging.sh
+    - bash -n tests/test_hil_boot_secret_injection.sh
+    - bash -n tests/test_hil_boot_iso_derivation_contract.sh
+    - bash -n tests/test_hil_boot_iso_real_build.sh
+    - bash -n tests/test_hil_boot_source_filter.sh
+    - bash -n tests/test_hil_boot_host_module.sh
+    - bash -n tests/test_cicd_regreener_host_removed.sh
+    - bash -n tests/test_hil_boot_services.sh
+    - bash -n tests/test_hil_boot_dnsmasq_scope.sh
+    - bash -n tests/test_hil_boot_ipxe_templates.sh
+    - bash -n tests/test_hil_boot_tofu_no_vdb.sh
+    - bash -n tests/test_safe_apply_hil_boot_scope.sh
+    - bash -n tests/test_regreener_stub_amt_e2e.sh
+    - bash -n tests/test_regreen_cluster.sh
+    - bash -n tests/test_remaster_pve_installer.sh
+    - bash -n tests/test_install_pve_node.sh
+    - bash -n tests/test_hil_boot_config_schema.sh
+    - bash -n tests/test_hil_gitlab_include.sh
+    - bash -n tests/test_pdu_cycle.sh
+    - bash -n tests/test_hil_regreening_docs.sh
+    - bash -n tests/test_new_site_regreener_compat.sh
+    - bash -n tests/test_bootstrap_sops_regreener_compat.sh
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+validate:meshcmd-package:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_meshcmd_packaging.sh
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+validate:meshcmd-source-filter:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_meshcmd_source_filter.sh
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+# HIL jobs are repo-local opt-ins; non-HIL sites must not see these jobs.
+.hil-configured-rules:
+  rules: &hil_configured_rules
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      exists:
+        - tests/hil/.gitlab-ci-hil.yml
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+      exists:
+        - tests/hil/.gitlab-ci-hil.yml
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+      exists:
+        - tests/hil/.gitlab-ci-hil.yml
+
+validate:paia:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_paia_packaging.sh
+  rules: *hil_configured_rules
+validate:hil-boot-secret:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_hil_boot_secret_injection.sh
+  rules: *hil_configured_rules
+validate:hil-boot-iso-contract:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_hil_boot_iso_derivation_contract.sh
+  rules: *hil_configured_rules
+validate:hil-boot-source-filter:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_hil_boot_source_filter.sh
+  rules: *hil_configured_rules
+validate:hil-boot-host:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_hil_boot_host_module.sh
+  rules: *hil_configured_rules
+validate:cicd-regreener-removed:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_cicd_regreener_host_removed.sh
+  rules: *hil_configured_rules
+validate:hil-boot-dnsmasq-scope:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_hil_boot_dnsmasq_scope.sh
+  rules: *hil_configured_rules
+validate:hil-boot-ipxe:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_hil_boot_ipxe_templates.sh
+  rules: *hil_configured_rules
+validate:hil-boot-tofu:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_hil_boot_tofu_no_vdb.sh
+  rules: *hil_configured_rules
+validate:safe-apply-hil-boot-scope:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_safe_apply_hil_boot_scope.sh
+  rules: *hil_configured_rules
+validate:pdu-cycle:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_pdu_cycle.sh
+  rules: *hil_configured_rules
+validate:hil-gitlab-include:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_hil_gitlab_include.sh
+  rules: *hil_configured_rules
+validate:hil-docs:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_hil_regreening_docs.sh
+  rules: *hil_configured_rules
+validate:regreener-host-module:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_regreener_host_module.sh
+  rules: *hil_configured_rules
+
+validate:regreener-config:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_regreener_config_schema.sh
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+validate:remaster-pve-installer:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_remaster_pve_installer.sh
+  rules: *hil_configured_rules
+validate:install-pve-node:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_install_pve_node.sh
+  rules: *hil_configured_rules
+validate:regreen-cluster:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_regreen_cluster.sh
+  rules: *hil_configured_rules
+validate:regreener-stub-e2e:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_regreener_stub_amt_e2e.sh
+  rules: *hil_configured_rules
+validate:regreener-docs:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_regreener_docs.sh
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+validate:regreener-no-site-hardcoding:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_regreener_no_site_hardcoding.sh
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+validate:publish-filter-hil:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_publish_filter_hil_excluded.sh
+  rules: *hil_configured_rules
+validate:new-site-regreener-compat:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_new_site_regreener_compat.sh
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+validate:bootstrap-sops-regreener-compat:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_bootstrap_sops_regreener_compat.sh
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+validate:publish-filter:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_publish_filter.sh
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+validate:publish-failure-classification:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_publish_failure_classification.sh
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+validate:publish-github-opt-in:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_publish_github_opt_in.sh
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+# Issue #297: regression for the publish-to-github oid parser. Locks in
+# that ls-remote stderr capture (e.g., SSH "Warning: Permanently added")
+# is rejected before reaching git push --force-with-lease.
+validate:publish-to-github-oid-parser:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_publish_to_github_oid_parser.sh
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+# Ratchets that the publish-test harnesses remain hermetic against the
+# per-run GITHUB_PUBLISH_ALLOW_INITIAL_REWRITE variable. The first prod-publish
+# run sets that variable pipeline-wide; if a future change drops the unset
+# from the test scripts, this job would fail by re-exhibiting the pipeline 845
+# leakage signature.
+validate:publish-tests-env-isolation:
+  stage: validate
+  tags: [infra]
+  variables:
+    GITHUB_PUBLISH_ALLOW_INITIAL_REWRITE: "1"
+  script:
+    - bash tests/test_publish_failure_classification.sh
+    - bash tests/test_publish_filter.sh
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+validate:github-deploy-key-seed:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_github_deploy_key_seed.sh
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+validate:configure-vault-github-seed:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_configure_vault_github_seed.sh
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+validate:verify-github-publish:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_verify_github_publish.sh
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+validate:github-remote-config:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_github_remote_config.sh
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+validate:tofu-github-remote-plumbing:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_tofu_github_remote_plumbing.sh
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+validate:gatus-github-mirror:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_gatus_github_mirror.sh
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+validate:github-mirror-drift:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_validate_github_mirror.sh
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+validate:dashboard-serving:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_dashboard_serving.sh
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+validate:dashboard-secret-plumbing:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_dashboard_secret_plumbing.sh
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+validate:approle-onboarding:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_approle_onboarding.sh
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+validate:cert-storage-policy:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_cert_storage_policy.sh
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+validate:cert-storage-backfill-idempotency:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_cert_storage_backfill_idempotency.sh
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+validate:configure-sentinel-gatus-resilience:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_configure_sentinel_gatus_resilience.sh
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+validate:configure-sentinel-gatus-deploy:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_configure_sentinel_gatus_deploy.sh
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+validate:cert-restore-renewal-conf:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_cert_restore_renewal_conf.sh
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+validate:cert-sync-script:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_cert_sync_script.sh
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+validate:certbot-backoff:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_certbot_initial_backoff.sh
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+validate:cert-budget:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_cert_budget_vault.sh
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+validate:grafana-dashboard-provisioning:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_grafana_dashboard_provisioning.sh
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+validate:rebuild-branch-guard:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_rebuild_branch_guard.sh
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+validate:rebuild-known-hosts-scope:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_rebuild_known_hosts_scope.sh
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+validate:reset-cluster-preserves-snippets:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_reset_cluster_preserves_snippets.sh
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+validate:rolling-reboot-node:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_rolling_reboot_node.sh
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+validate:converge-cluster:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_converge_cluster.sh
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+validate:safe-apply-ha-flow:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_safe_apply_ha_flow.sh
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+validate:safe-apply-recovery:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_safe_apply_recovery.sh
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+validate:rebuild-ha-flow:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_rebuild_ha_flow.sh
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+validate:converge-vm-interface:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_converge_vm_interface.sh
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+validate:converge-vm-scope:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_converge_vm_scope.sh
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+validate:converge-sprint-029-steps:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_converge_sprint_029_steps.sh
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+validate:convergence-parity:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_convergence_parity.sh
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+validate:certbot-override-scope:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_rebuild_staging_override.sh
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+validate:certbot-persisted-state:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_certbot_persisted_state.sh
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+validate:certbot-cluster-failure-modes:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_certbot_cluster_failure_modes.sh
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+validate:overlay-root-config:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_overlay_root_config.sh
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+validate:converge-closure-step:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_converge_closure_step.sh
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+validate:field-updatable-config:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_field_updatable_config.sh
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+validate:closure-drift-check:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_closure_drift_check.sh
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+validate:closure-paths-artifact:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_closure_paths_artifact.sh
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+validate:deploy-control-plane-logic:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_deploy_control_plane.sh
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+validate:gitlab-ci-control-plane-stages:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_gitlab_ci_control_plane_stages.sh
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+validate:vm-health-lib:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_vm_health_lib.sh
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+validate:backup-pin-file:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_backup_pin_file.sh
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+validate:restore-before-start:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_restore_before_start.sh
+    - bash tests/test_list_backup_backed_vmids.sh
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+validate:restore-from-pbs-leave-stopped:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_restore_from_pbs_leave_stopped.sh
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+validate:restore-from-pbs-backup-id:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_restore_from_pbs_backup_id.sh
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+validate:preboot-tofu-contract:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_preboot_tofu_contract.sh
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+validate:manifest-invariant:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_manifest_derivation_invariant.sh
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+validate:safe-apply-preboot-restore:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_safe_apply_preboot_restore.sh
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+validate:no-double-restore:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_no_double_restore_after_phase_2.sh
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+validate:rebuild-preboot-restore:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_rebuild_pbs_install_before_preboot_restore.sh
+    - bash tests/test_rebuild_preboot_restore.sh
+    - bash tests/test_rebuild_restore_pin_file.sh
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+validate:vdb-gate-removed:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_vdb_gate_removed.sh
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+validate:nix-arg-glue-antipattern:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_nix_arg_glue_antipattern.sh
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+validate:failure-injection-pbs:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_failure_injection_pbs_unreachable.sh
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+validate:failure-injection-qmrestore:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_failure_injection_qmrestore_fails.sh
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+validate:failure-injection-dd:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_failure_injection_dd_errors.sh
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+validate:failure-injection-manifest:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_failure_injection_malformed_manifest.sh
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+validate:failure-injection-missing-backup:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_failure_injection_missing_backup.sh
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+validate:tofu-image-validation:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_tofu_image_validation.sh
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+
+validate:grub-fixup-shared:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_grub_fixup_shared.sh
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+validate:generation-cleanup:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_generation_cleanup.sh
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+validate:metrics-dual-target:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_metrics_dual_target.sh
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+validate:field-updatable-flag:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_field_updatable_flag.sh
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+validate:ssh-host-key-restore:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_ssh_host_key_restore.sh
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+validate:operations-runbooks:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_operations_md_runbooks.sh
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+validate:post-deploy-status:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_pipeline_post_deploy_status.sh
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+validate:vm-pool-tags:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_vm_pool_tags.sh
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+validate:workstation-module:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_workstation_module.sh
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+validate:sprint-028-revert-baseline:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_sprint_028_revert_baseline.sh
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+validate:cert-wait-env-scope:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_validate_cert_wait_scope.sh
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+validate:static-disk-size-no-null:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_static_disk_size_no_null.sh
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+validate:bench-scheduled-ci-dispatch:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_bench_scheduled_ci_dispatch.sh
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+validate:run-on-host-trigger:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_run_on_host_trigger_propagation.sh
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+validate:run-on-host-unattended:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_run_on_host_unattended.sh
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+validate:run-scheduled-bench-sigterm:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_run_scheduled_bench_sigterm_cleanup.sh
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+validate:run-scheduled-bench:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_run_scheduled_bench.sh
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+validate:bench-scheduled-status:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_bench_scheduled_status_metrics.sh
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+validate:benchmark-harness:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_benchmark_harness.sh
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+validate:benchmark-scheduled-docs:
+  stage: validate
+  tags: [infra]
+  script:
+    - bash tests/test_benchmark_scheduled_docs.sh
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+# --- Build ---
+
+# Per-role image builds run in parallel — runner concurrent=8 (Sprint 030 C001)
+# lets up to 8 of these execute simultaneously. Sprint 030 C002 fan-out.
+#
+# IMPORTANT: the matrix list is the source of truth for which roles the
+# pipeline builds in parallel. It MUST stay in sync with the union of
+# framework/images.yaml, site/images.yaml, and enabled apps in
+# site/applications.yaml. merge-image-versions.sh fails loudly on drift
+# (missing or unexpected fragments) — that catches forgotten updates.
+#
+# NOTE: this matrix assumes every role has category: nix. If a role with
+# category: external is added to a manifest, the per-role job will fail
+# (build-image.sh will look for a missing .nix file) — extend the script
+# below to read the manifest's category field and dispatch to
+# build-image.sh --external when needed. No current role uses Category B,
+# so the dispatch is deferred until the first one lands.
+build:image:
+  stage: build
+  tags: [infra]
+  variables:
+    # 8 parallel jobs × 4 cores each = 32 thread budget on a 12-vCPU runner.
+    # Mild oversubscription is fine; nix builds are partially I/O-bound.
+    NIX_BUILD_CORES: "4"
+  parallel:
+    matrix:
+      - ROLE:
+          - dns
+          - vault
+          - gitlab
+          - cicd
+          - hil-boot
+          - acme-dev
+          - gatus
+          - testapp
+          - influxdb
+          - grafana
+          - roon
+  script:
+    - echo "=== Building ${ROLE} ==="
+    - |
+      if [ "$ROLE" = "hil-boot" ] && [ ! -f tests/hil/.gitlab-ci-hil.yml ]; then
+        echo "HIL config absent; skipping hil-boot image build"
+        exit 0
+      fi
+    - HOST_CONFIG="site/nix/hosts/${ROLE}.nix"
+    - framework/scripts/build-image.sh "$HOST_CONFIG" "$ROLE"
+    - mkdir -p build/image-versions
+    - grep -E "^[[:space:]]*\"${ROLE}\"[[:space:]]*=" site/tofu/image-versions.auto.tfvars > "build/image-versions/${ROLE}.tfvars-fragment"
+    - cat "build/image-versions/${ROLE}.tfvars-fragment"
+    - |
+      if [ "$ROLE" = "gitlab" ] || [ "$ROLE" = "cicd" ]; then
+        echo "=== Building system closure: ${ROLE} ==="
+        nix build --print-out-paths \
+          --out-link "build/closure-${ROLE}" \
+          ".#nixosConfigurations.${ROLE}.config.system.build.toplevel" \
+          > "build/closure-path-${ROLE}.txt"
+        cat "build/closure-path-${ROLE}.txt"
+      fi
+  artifacts:
+    paths:
+      - build/image-versions/
+      - build/closure-gitlab
+      - build/closure-cicd
+      - build/closure-path-gitlab.txt
+      - build/closure-path-cicd.txt
+    expire_in: 1 hour
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+build:hil-boot-iso-real:
+  stage: build
+  tags: [infra]
+  needs:
+    - job: "build:image"
+      artifacts: false
+  script:
+    - bash tests/test_hil_boot_iso_real_build.sh
+  # Shares /nix/store with build:image: [hil-boot]: by the time this job
+  # runs, the upstream PVE ISO has been fetched and paia is built, so
+  # the per-node ISO derivation reuses the same fetchurl output.
+  rules: *hil_configured_rules
+
+build:merge:
+  stage: build
+  tags: [infra]
+  needs:
+    - job: "build:image"
+      artifacts: true
+  script:
+    - echo "=== Merging per-role image fragments ==="
+    - framework/scripts/merge-image-versions.sh
+    - echo "=== Generating Gatus config ==="
+    - mkdir -p site/gatus
+    - GATUS_GITHUB_EXPECTED_SOURCE_COMMIT="${CI_COMMIT_SHA:-}" framework/scripts/generate-gatus-config.sh > site/gatus/config.yaml
+  artifacts:
+    paths:
+      - build/closure-paths.json
+      - build/closure-gitlab
+      - build/closure-cicd
+      - site/tofu/image-versions.auto.tfvars
+      - site/gatus/config.yaml
+    expire_in: 1 hour
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+# --- Deploy Dev ---
+
+deploy:dev:
+  stage: deploy-dev
+  tags: [infra]
+  dependencies:
+    - build:merge
+  variables:
+    PIN_FILE: "build/restore-pin-dev.json"
+  script:
+    - echo "=== Pre-deploy backup ==="
+    - |
+      FIRST_NODE=$(yq -r '.nodes[0].mgmt_ip' site/config.yaml)
+      PBS_REGISTERED=$(ssh -n -o ConnectTimeout=5 -o StrictHostKeyChecking=no -o BatchMode=yes \
+        "root@${FIRST_NODE}" "pvesm status 2>/dev/null | grep -c pbs-nas" 2>/dev/null || echo "0")
+      if framework/scripts/backup-now.sh --env dev --pin-out "$PIN_FILE"; then
+        echo "Pre-deploy backup complete"
+      elif [[ "$PBS_REGISTERED" -gt 0 ]]; then
+        echo "FATAL: PBS is configured but backup failed. Refusing to deploy." >&2
+        echo "Fix the backup failure before deploying." >&2
+        exit 1
+      else
+        echo "WARNING: PBS not yet configured — skipping pre-deploy backup"
+        echo "This is expected on first deploy."
+      fi
+    - echo "=== Deploying to dev ==="
+    - framework/scripts/tofu-wrapper.sh init -input=false
+    - framework/scripts/ensure-app-secrets.sh
+    # safe-apply.sh runs stopped apply -> restore-before-start -> start apply,
+    # then post-success convergence. Phase 1 failures use
+    # restore-before-start --recovery-mode (#224).
+    - framework/scripts/safe-apply.sh dev
+    - echo "=== Deploying workstation dev closure ==="
+    - framework/scripts/deploy-workstation-closure.sh dev
+  artifacts:
+    when: always
+    name: "deploy-dev-$CI_JOB_ID"
+    paths:
+      - build/restore-pin-dev.json
+      - build/preboot-restore-*.json
+      - build/preboot-restore-status-*.json
+      - build/first-deploy-allow-*.json
+    expire_in: 1 month
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+
+# --- Deploy Control Plane Dev ---
+
+deploy:control-plane:gitlab:dev:
+  stage: deploy-control-plane-dev
+  tags: [infra]
+  dependencies:
+    - build:merge
+  script:
+    - echo "=== Deploying control-plane closure to gitlab (dev pipeline) ==="
+    - framework/scripts/deploy-control-plane.sh dev gitlab
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+
+deploy:control-plane:cicd:dev:
+  stage: deploy-control-plane-dev
+  tags: [infra]
+  needs:
+    - job: "deploy:control-plane:gitlab:dev"
+      artifacts: false
+    - job: "build:merge"
+      artifacts: true
+  script:
+    - echo "=== Deploying control-plane closure to cicd (dev pipeline) ==="
+    - framework/scripts/deploy-control-plane.sh dev cicd
+  retry:
+    max: 2
+    when:
+      - runner_system_failure
+      - stuck_or_timeout_failure
+      - job_execution_timeout
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+
+# --- Converge Dev ---
+# Non-destructive cluster-state reconciliation. Two phases:
+#   - Phase A (additive, #358): apply missing snippet uploads on all nodes.
+#   - Phase B (orphan cleanup, #359): delete on-disk snippets not in
+#     tofu state. Empty-expected safety gate refuses mass-delete if state
+#     reports zero snippets — see converge-cluster.sh header for details.
+# Safe to apply on a running cluster — never touches VM resources.
+
+converge:dev:
+  stage: converge-dev
+  tags: [infra]
+  script:
+    # Every tofu-touching job inits first: the shell-executor runner uses
+    # concurrent slots, each with its own .terraform/. Without init,
+    # converge-cluster.sh's first `tofu state list` would fail on a
+    # fresh slot with "backend initialization required."
+    - echo "=== OpenTofu Init ==="
+    - framework/scripts/tofu-wrapper.sh init -input=false
+    - echo "=== Converging cluster state — Phase A (snippet upload) then Phase B (orphan delete) ==="
+    - framework/scripts/converge-cluster.sh
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+
+# --- Test Dev ---
+
+test:dev:
+  stage: test-dev
+  tags: [infra]
+  script:
+    - echo "=== Validating dev deployment ==="
+    - framework/scripts/validate.sh --regression-safe dev
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "dev"
+
+regression:
+  stage: test-dev
+  tags: [infra]
+  script:
+    - echo "=== Full regression suite ==="
+    - framework/scripts/validate.sh --regression dev
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+
+bench:scheduled:
+  stage: test-dev
+  tags: [infra]
+  timeout: 3h
+  allow_failure: true
+  script:
+    - |
+      # Gate on benchmarks.scheduled.enabled in site/config.yaml. Same pattern
+      # as publish:github (see lines ~1962). GitLab evaluates rules at
+      # pipeline creation, before any prepare-stage job could populate a
+      # dotenv var, so the site opt-in gate must run in-script. Reading
+      # config.yaml here keeps the gate inside the same source of truth
+      # validate-site-config.sh enforces. A downstream cluster that has not
+      # opted in is protected even if a schedule with
+      # BENCH_SCHEDULE_KEY=bench-nightly is created in GitLab UI.
+      enabled=$(yq -r '.benchmarks.scheduled.enabled // false' site/config.yaml)
+      if [[ "${enabled}" != "true" ]]; then
+        echo "benchmarks.scheduled.enabled is not true; skipping bench:scheduled." >&2
+        exit 0
+      fi
+    - benchmarks/run-scheduled-bench.sh
+  artifacts:
+    when: always
+    expire_in: 1 month
+    paths:
+      - build/bench-scheduled/status.json
+      - build/bench-scheduled/*.log
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule" && $BENCH_SCHEDULE_KEY == "bench-nightly"
+
+# --- Deploy Prod ---
+
+deploy:prod:
+  stage: deploy-prod
+  tags: [infra]
+  dependencies:
+    - build:merge
+  variables:
+    PIN_FILE: "build/restore-pin-prod.json"
+  script:
+    - echo "=== Pre-deploy backup ==="
+    - |
+      FIRST_NODE=$(yq -r '.nodes[0].mgmt_ip' site/config.yaml)
+      PBS_REGISTERED=$(ssh -n -o ConnectTimeout=5 -o StrictHostKeyChecking=no -o BatchMode=yes \
+        "root@${FIRST_NODE}" "pvesm status 2>/dev/null | grep -c pbs-nas" 2>/dev/null || echo "0")
+      if framework/scripts/backup-now.sh --env prod --pin-out "$PIN_FILE"; then
+        echo "Pre-deploy backup complete"
+      elif [[ "$PBS_REGISTERED" -gt 0 ]]; then
+        echo "FATAL: PBS is configured but backup failed. Refusing to deploy." >&2
+        echo "Fix the backup failure before deploying." >&2
+        exit 1
+      else
+        echo "WARNING: PBS not yet configured — skipping pre-deploy backup"
+        echo "This is expected on first deploy."
+      fi
+    - echo "=== Cert budget preflight ==="
+    - framework/scripts/check-cert-budget.sh prod
+    - echo "=== Deploying to prod ==="
+    - framework/scripts/tofu-wrapper.sh init -input=false
+    - framework/scripts/ensure-app-secrets.sh
+    # safe-apply.sh runs stopped apply -> restore-before-start -> start apply,
+    # then post-success convergence. Phase 1 failures use
+    # restore-before-start --recovery-mode (#224).
+    - framework/scripts/safe-apply.sh prod
+    - echo "=== Deploying workstation prod closure ==="
+    - framework/scripts/deploy-workstation-closure.sh prod
+  artifacts:
+    when: always
+    name: "deploy-prod-$CI_JOB_ID"
+    paths:
+      - build/restore-pin-prod.json
+      - build/preboot-restore-*.json
+      - build/preboot-restore-status-*.json
+      - build/first-deploy-allow-*.json
+    expire_in: 1 month
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+# --- Deploy Control Plane Prod ---
+
+deploy:control-plane:gitlab:prod:
+  stage: deploy-control-plane-prod
+  tags: [infra]
+  dependencies:
+    - build:merge
+  script:
+    - echo "=== Deploying control-plane closure to gitlab (prod pipeline) ==="
+    - framework/scripts/deploy-control-plane.sh prod gitlab
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+deploy:control-plane:cicd:prod:
+  stage: deploy-control-plane-prod
+  tags: [infra]
+  needs:
+    - job: "deploy:control-plane:gitlab:prod"
+      artifacts: false
+    - job: "build:merge"
+      artifacts: true
+  script:
+    - echo "=== Deploying control-plane closure to cicd (prod pipeline) ==="
+    - framework/scripts/deploy-control-plane.sh prod cicd
+  retry:
+    max: 2
+    when:
+      - runner_system_failure
+      - stuck_or_timeout_failure
+      - job_execution_timeout
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+# --- Converge Prod ---
+# Same as converge:dev but for the prod pipeline.
+
+converge:prod:
+  stage: converge-prod
+  tags: [infra]
+  script:
+    - echo "=== OpenTofu Init ==="
+    - framework/scripts/tofu-wrapper.sh init -input=false
+    - echo "=== Converging cluster state — Phase A (snippet upload) then Phase B (orphan delete) ==="
+    - framework/scripts/converge-cluster.sh
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+# --- Test Prod ---
+
+test:prod:
+  stage: test-prod
+  tags: [infra]
+  script:
+    - echo "=== Validating prod deployment ==="
+    - framework/scripts/validate.sh --regression-safe prod
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
+
+publish:github:
+  stage: publish-github
+  tags: [infra]
+  script:
+    - |
+      # Gate on publish.github.enabled in site/config.yaml. We cannot use a
+      # rule like `$PUBLISH_GITHUB_ENABLED == "true"` because GitLab evaluates
+      # rules at pipeline creation, before any prepare-stage job could populate
+      # a dotenv var. Reading config.yaml here keeps the gate inside the same
+      # source of truth that validate-site-config.sh enforces.
+      enabled=$(yq -r '.publish.github.enabled // false' site/config.yaml)
+      if [[ "${enabled}" != "true" ]]; then
+        echo "publish.github.enabled is not true; skipping publish:github." >&2
+        exit 0
+      fi
+    - echo "=== Publishing framework mirror to GitHub ==="
+    - framework/scripts/publish-to-github.sh
+  artifacts:
+    when: always
+    paths:
+      - build/github-publish-status.json
+    expire_in: 1 month
+  rules:
+    - if: $BENCH_SCHEDULE_KEY
+      when: never
+    - if: $CI_PIPELINE_SOURCE != "web" && $CI_COMMIT_BRANCH == "prod"
