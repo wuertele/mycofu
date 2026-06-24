@@ -1,0 +1,167 @@
+## Step 7: GitLab and CI/CD
+
+GitLab and the GitLab Runner are NixOS VMs on the **management network**
+(native/untagged VLAN). GitLab has a Let's Encrypt certificate via certbot
+with explicit FQDN support. The runner is stateless and fully rebuildable.
+
+> **Deployment model:** GitLab and the runner are **Tier 2** (workstation-managed).
+> The pipeline cannot deploy the infrastructure it runs on. See architecture.md
+> section 10.3 for the two-tier deployment model.
+
+### 7.1 Prerequisites
+
+Before deploying GitLab:
+- [ ] DNS record `gitlab.{{ environments.prod.dns_domain }}` exists pointing to `{{ vms.gitlab.ip }}`
+- [ ] Prod DNS servers are reachable from management network (for certbot DNS-01)
+- [ ] DHCP reservation for GitLab: MAC `{{ vms.gitlab.mac }}` → `{{ vms.gitlab.ip }}`
+- [ ] DHCP reservation for Runner: MAC `{{ vms.cicd.mac }}` → `{{ vms.cicd.ip }}`
+
+Verify DNS:
+```bash
+dig gitlab.{{ environments.prod.dns_domain }} @{{ vms.dns1_prod.ip }}
+# Expected: {{ vms.gitlab.ip }}
+```
+
+### 7.2 Build and Deploy GitLab
+
+```bash
+# Build the GitLab image (this takes a while — GitLab CE is large)
+framework/scripts/build-image.sh site/nix/hosts/gitlab.nix gitlab
+
+# Deploy
+cd site/tofu
+framework/scripts/tofu-wrapper.sh apply -target=module.gitlab
+```
+
+GitLab takes 5–10 minutes to start on first boot (database migrations, asset
+compilation). Wait for it to become accessible:
+
+```bash
+# Wait for GitLab API
+while ! curl -sk https://{{ vms.gitlab.ip }}/api/v4/version 2>/dev/null | jq -r '.version'; do
+  echo "Waiting for GitLab..."; sleep 15
+done
+```
+
+- [ ] GitLab VM deployed
+- [ ] GitLab API accessible at `https://gitlab.{{ environments.prod.dns_domain }}`
+- [ ] TLS certificate is from Let's Encrypt (not self-signed)
+
+### 7.3 Configure GitLab
+
+```bash
+framework/scripts/configure-gitlab.sh
+```
+
+This script:
+1. Waits for GitLab to be accessible
+2. Retrieves the initial root password and stores it in SOPS
+3. Creates the `infra` project
+4. Generates a runner registration token and stores it in SOPS
+
+After running:
+- [ ] Log into GitLab web UI and change the root password
+- [ ] Update SOPS with new password:
+  ```bash
+  sops --set '["gitlab_root_password"] "<new-password>"' site/sops/secrets.yaml
+  ```
+- [ ] Push the repository:
+  ```bash
+  git remote add gitlab https://gitlab.{{ environments.prod.dns_domain }}/root/infra.git
+  git push gitlab --all
+  ```
+
+### 7.4 Build and Deploy the Runner
+
+```bash
+# Build the Runner image
+framework/scripts/build-image.sh site/nix/hosts/cicd.nix cicd
+
+# Deploy
+framework/scripts/tofu-wrapper.sh apply -target=module.cicd
+
+# HA double-apply (if VMID changes)
+framework/scripts/tofu-wrapper.sh apply -target=module.cicd
+```
+
+- [ ] Runner VM deployed at `{{ vms.cicd.ip }}`
+
+### 7.5 Register the Runner
+
+```bash
+framework/scripts/register-runner.sh
+```
+
+Verify:
+```bash
+# Runner has all required tools
+ssh root@{{ vms.cicd.ip }} "which bash nix tofu sops yq jq curl git dig openssl"
+
+# Runner is online in GitLab
+# Check GitLab web UI → Admin → Runners
+```
+
+- [ ] Runner registered and online in GitLab
+- [ ] Runner has infra and deploy tags
+
+### 7.6 Test the Pipeline
+
+1. Push a change to the `dev` branch on GitLab
+2. Verify pipeline runs: validate → build → deploy-dev → test-dev
+3. Verify content-addressed naming: unchanged roles produce same filenames
+4. Verify no unnecessary VM recreation
+
+- [ ] Pipeline runs on push to dev
+- [ ] Dev deployment works via CI/CD
+- [ ] No VMs recreated for unchanged roles (content-addressed naming)
+
+### 7.7 Control-Plane Update Procedure
+
+GitLab and the runner are Tier 2 — update from the workstation only:
+
+```bash
+# Update order: GitLab first, then runner (runner registration is in GitLab's DB)
+
+# 1. Update GitLab
+framework/scripts/build-image.sh site/nix/hosts/gitlab.nix gitlab
+framework/scripts/tofu-wrapper.sh apply -target=module.gitlab
+# Wait for GitLab to become accessible (~5 min on first boot)
+
+# 2. Update Runner
+framework/scripts/build-image.sh site/nix/hosts/cicd.nix cicd
+framework/scripts/tofu-wrapper.sh apply -target=module.cicd
+framework/scripts/register-runner.sh
+```
+
+### 7.8 Backup and Recovery
+
+GitLab is included in the PBS backup job alongside Vault VMs:
+
+```bash
+# Verify backup job includes GitLab
+ssh root@{{ nodes[0].mgmt_ip }} "pvesh get /cluster/backup --output-format json" | jq '.[].vmid'
+
+# Manual backup test
+GITLAB_VMID=$(ssh root@{{ nodes[0].mgmt_ip }} "qm list" | grep gitlab | awk '{print $1}')
+ssh root@{{ nodes[0].mgmt_ip }} "vzdump $GITLAB_VMID --storage pbs-nas --mode snapshot --compress zstd"
+
+# Configure ZFS replication for both VMs
+framework/scripts/configure-replication.sh gitlab
+framework/scripts/configure-replication.sh cicd
+```
+
+- [ ] GitLab backup job created and tested
+- [ ] ZFS replication configured for GitLab and Runner
+
+### 7.9 Validation Summary
+
+| Gate | Test | Status |
+|------|------|--------|
+| V7.1 | `curl -s https://gitlab.{{ environments.prod.dns_domain }}/api/v4/version` → JSON | |
+| V7.2 | Runner online in Admin → Runners with correct tags | |
+| V7.3 | `ssh root@{{ vms.cicd.ip }} "which bash nix tofu sops yq jq curl git dig openssl"` | |
+| V7.4 | Pipeline runs on push to dev | |
+| V7.5 | End-to-end deploy via CI/CD | |
+| V7.6 | SOPS age key at `/run/secrets/sops/age-key` on runner | |
+| V7.7 | GitLab backup completes | |
+| V7.8 | `certbot renew` on GitLab VM (LE cert renewal) | |

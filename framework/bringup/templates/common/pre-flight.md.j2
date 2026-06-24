@@ -1,0 +1,42 @@
+## Pre-Flight Checklist
+
+Verify all physical prerequisites before proceeding.
+
+- [ ] All {{ nodes | length }} nodes are racked and powered
+{%- for node in nodes %}
+  - [ ] {{ node.name }}: hardware installed, cabled to managed switch
+{%- endfor %}
+- [ ] Each node has boot NVMe and data NVMe installed
+- [ ] All nodes are cabled to the managed switch
+{%- if has_replication_network %}
+- [ ] Point-to-point replication cables between all node pairs:
+{%- for node in nodes %}
+{%- if node.repl_peers is defined and node.repl_peers %}
+{%- for peer_name, peer in node.repl_peers.items() %}
+{%- if node.name < peer_name %}
+  - [ ] {{ node.name }} ({{ peer.iface }}) ↔ {{ peer_name }}: DAC cable connected
+{%- endif %}
+{%- endfor %}
+{%- endif %}
+{%- endfor %}
+{%- endif %}
+- [ ] NAS ({{ nas.hostname }}) is powered and accessible at {{ nas.ip }}
+- [ ] SSH key access to NAS: `ssh {{ nas.ssh_user }}@{{ nas.ip }}` works without password
+- [ ] Proxmox ISO available on USB drive
+- [ ] Operator workstation can reach management subnet ({{ management.subnet }})
+- [ ] Can log into domain registrar at {{ platforms.registrar.url }}
+- [ ] Know how to add DNS records (NS and A) at the registrar
+- [ ] Have verified existing email records (MX, SPF, DMARC) for {{ domain }}
+- [ ] `age` and `sops` CLI tools installed on operator workstation
+- [ ] `nix` package manager installed on operator workstation
+{%- if nix_builder is defined and nix_builder.type is defined %}
+{%- if nix_builder.type == 'linux-builder' %}
+- [ ] macOS with Nix installed (the linux-builder VM will be set up in a later step)
+- [ ] At least 8GB RAM available for the Nix linux-builder VM
+{%- elif nix_builder.type == 'remote' %}
+- [ ] SSH access to `{{ nix_builder.remote_host }}` as `{{ nix_builder.remote_user }}` using key `{{ nix_builder.remote_ssh_key }}`
+- [ ] Remote host is running Linux (`uname -s` returns `Linux`)
+{%- elif nix_builder.type == 'local' %}
+- [ ] Workstation is Linux with Nix installed
+{%- endif %}
+{%- endif %}

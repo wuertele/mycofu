@@ -1,0 +1,154 @@
+## Nix Builder Setup
+
+NixOS VM images are built using the Nix package manager, which requires a Linux
+execution environment for the build sandbox.
+
+{% if nix_builder.type == 'local' %}
+{# --- Local (Linux workstation) --- #}
+
+Your workstation is configured as a Linux system (`nix_builder.type: local`).
+No additional builder setup is needed — Nix builds Linux derivations natively.
+
+**Verify:**
+```bash
+framework/scripts/setup-nix-builder.sh --verify
+```
+- [ ] Script reports "Nix builder: local. No setup needed."
+- [ ] Test build succeeds
+
+{% elif nix_builder.type == 'linux-builder' %}
+{# --- Nix-managed local VM (macOS) --- #}
+
+Your workstation is macOS. Nix will manage a lightweight NixOS VM locally
+to provide a Linux build environment. This is transparent — `nix build`
+commands delegate to the VM automatically.
+
+### Recommended nix-darwin Configuration
+
+Add to your nix-darwin configuration (e.g., `~/.config/nix-darwin/flake.nix`):
+
+```nix
+nix.linux-builder = {
+  enable = true;
+  ephemeral = true;     # Recreate disk on restart (required for config changes)
+  maxJobs = 4;
+  config = {
+    virtualisation = {
+      darwin-builder = {
+        diskSize = 80 * 1024;    # 80GB — must fit the largest image closure
+        memorySize = {{ (nix_builder.memory_gb | default(24)) }} * 1024;
+      };
+      cores = {{ nix_builder.cpus | default(8) }};
+    };
+  };
+};
+```
+
+Then run: `darwin-rebuild switch`
+
+> **Why these settings matter:** The default linux-builder has 1 core, 3 GB
+> RAM, and a small writable disk overlay (~1GB). NixOS image builds (especially
+> GitLab at ~6.4GB) require significantly more resources and disk space.
+
+> **Important:** Do NOT run `nix-collect-garbage` on the host while actively
+> using the builder. The host's `/nix/store` is the builder's read-only cache.
+> GC-ing it forces the builder to re-download paths into its small writable
+> overlay, which can overflow on large builds. If you must GC, repopulate
+> the shared closure afterward:
+> `nix build .#packages.x86_64-linux.gitlab-image --no-link`
+
+**Setup:**
+```bash
+framework/scripts/setup-nix-builder.sh
+```
+
+This script will:
+- Detect whether you're using nix-darwin or standalone Nix
+- Generate `~/.nix-builder/start-builder.sh` with correct QEMU_OPTS
+- Write `/etc/nix/machines` with maxJobs={{ nix_builder.cpus | default(8) }}
+- Start the builder VM and verify it can compile a Linux derivation
+
+{# Note: don't document the internal nix-darwin vs standalone distinction here.
+   The script handles detection and prints the right instructions. Documenting
+   both paths in the bringup guide would violate the deduplication principle. #}
+
+**Verify:**
+```bash
+framework/scripts/setup-nix-builder.sh --verify
+# Test that the builder can build a real derivation:
+nix build --impure --expr '(import <nixpkgs> { system = "x86_64-linux"; }).hello' --no-link
+```
+- [ ] Builder VM is running with correct resources
+- [ ] Test build completes without error
+
+**Restart the builder** if it breaks or after a reboot:
+```bash
+framework/scripts/setup-nix-builder.sh --stop
+framework/scripts/setup-nix-builder.sh --start
+```
+
+{% elif nix_builder.type == 'remote' %}
+{# --- Remote builder via SSH --- #}
+
+Your workstation delegates NixOS image builds to a remote Linux host over SSH.
+
+**Remote host:** `{{ nix_builder.remote_user }}@{{ nix_builder.remote_host }}`
+**SSH key:** `{{ nix_builder.remote_ssh_key }}`
+
+### Step 1: Install Nix on the remote host
+
+SSH to the remote host and install the Nix package manager:
+
+```bash
+ssh {{ nix_builder.remote_user }}@{{ nix_builder.remote_host }}
+curl -L https://nixos.org/nix/install | sh --daemon
+```
+
+After installation, verify (still on the remote host):
+```bash
+nix --version
+```
+- [ ] Nix is installed and reports a version number
+
+> **Note:** This installs the Nix *package manager* on the existing OS
+> (e.g., Debian on a Proxmox node). It does NOT convert the host to NixOS.
+> Nix installs entirely under `/nix/` and does not modify system packages.
+
+Log out of the remote host.
+
+### Step 2: Configure local workstation
+
+Run the setup script from your workstation:
+```bash
+framework/scripts/setup-nix-builder.sh
+```
+
+This script will:
+- Verify SSH connectivity to `{{ nix_builder.remote_host }}`
+- Verify Nix is installed on the remote host
+- Add the remote builder to `/etc/nix/machines`
+- Configure `nix.conf` for remote builds
+- Restart nix-daemon
+
+### Verify
+
+```bash
+framework/scripts/setup-nix-builder.sh --verify
+```
+- [ ] SSH to `{{ nix_builder.remote_host }}` succeeds without password prompt
+- [ ] Remote host has Nix installed
+- [ ] Test build of a Linux derivation succeeds
+- [ ] `nix build --impure --expr '(import <nixpkgs> { system = "x86_64-linux"; }).hello' --no-link` completes without error
+
+> **Cleanup (for later):** Once CI/CD handles image builds (Step 7), the remote
+> builder is no longer needed. To remove Nix from the remote host:
+> `ssh {{ nix_builder.remote_user }}@{{ nix_builder.remote_host }} "rm -rf /nix && rm -rf /etc/nix"`
+
+{% else %}
+{# --- Unknown type --- #}
+
+**WARNING:** `nix_builder.type: {{ nix_builder.type }}` is not recognized.
+Valid values: `local`, `linux-builder`, `remote`.
+Update `site/config.yaml` and re-run `generate-bringup.sh`.
+
+{% endif %}
