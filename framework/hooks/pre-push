@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# pre-push hook — prevent direct pushes to dev and prod branches.
+#
+# All changes to dev and prod must go through GitLab merge requests.
+# This hook is the client-side guard. GitLab branch protection is the
+# server-side backstop.
+#
+# Install: cp framework/hooks/pre-push .git/hooks/pre-push
+# Or:      ln -sf ../../framework/hooks/pre-push .git/hooks/pre-push
+#
+# Override: git push --no-verify (requires explicit intent)
+
+set -euo pipefail
+
+PROTECTED_BRANCHES="dev prod main"
+
+remote="$1"
+
+while read -r local_ref local_oid remote_ref remote_oid; do
+  # Extract the branch name from the remote ref
+  remote_branch="${remote_ref#refs/heads/}"
+
+  for protected in $PROTECTED_BRANCHES; do
+    if [[ "$remote_branch" == "$protected" ]]; then
+      echo ""
+      echo "ERROR: Direct push to '${protected}' is not allowed."
+      echo ""
+      echo "  All changes to ${protected} must go through a merge request."
+      echo "  Create a feature branch and push that instead:"
+      echo ""
+      echo "    git checkout -b fix/my-change"
+      echo "    git push gitlab fix/my-change"
+      echo "    # Then create an MR in GitLab"
+      echo ""
+      echo "  To bypass this check (emergency only):"
+      echo "    git push --no-verify gitlab ${protected}"
+      echo ""
+      exit 1
+    fi
+  done
+done
+
+exit 0
