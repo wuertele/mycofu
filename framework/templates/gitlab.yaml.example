@@ -1,0 +1,77 @@
+# site/gitlab.yaml — GitLab project settings (operator-configurable).
+#
+# These settings are applied by configure-gitlab.sh during project setup.
+# Framework-essential settings (branch protection, telemetry, runner tags)
+# are NOT here — they're hardcoded in configure-gitlab.sh because the
+# architecture depends on them.
+#
+# This file is for workflow preferences that operators may customize.
+
+# Issue labels — created via the GitLab API during project setup.
+# Idempotent: existing labels are not modified or duplicated.
+# Operators can add, remove, or rename labels here. Changes take
+# effect on the next run of configure-gitlab.sh.
+#
+# Colors are hex codes. GitLab requires the # prefix.
+labels:
+  # Severity: how bad is it when it happens
+  - name: S1-blocker
+    color: "#dc3545"
+    description: "Prevents deployment or causes data loss"
+  - name: S2-major
+    color: "#fd7e14"
+    description: "Feature broken, no workaround"
+  - name: S3-minor
+    color: "#ffc107"
+    description: "Feature broken, workaround exists"
+  - name: S4-cosmetic
+    color: "#6c757d"
+    description: "Incorrect but harmless"
+
+  # Priority: when to fix it
+  - name: P1-now
+    color: "#dc3545"
+    description: "Fix before next deploy"
+  - name: P2-soon
+    color: "#fd7e14"
+    description: "Fix this sprint"
+  - name: P3-planned
+    color: "#17a2b8"
+    description: "Fix when convenient"
+  - name: P4-backlog
+    color: "#6c757d"
+    description: "Fix someday"
+
+  # Category: what kind of work
+  - name: bug
+    color: "#dc3545"
+    description: "Something is broken or produces wrong results"
+  - name: enhancement
+    color: "#28a745"
+    description: "Missing feature or validation gap"
+  - name: documentation
+    color: "#0075ca"
+    description: "Docs need updating or are inaccurate"
+  - name: refactor
+    color: "#7057ff"
+    description: "Code quality, dead code, or maintenance burden"
+  - name: test
+    color: "#e4e669"
+    description: "New or improved validation test"
+  - name: validation
+    color: "#1aaa55"
+    description: "Test plan to verify fixes work end-to-end"
+
+# Milestones — created via the GitLab API during project setup.
+# Idempotent: existing milestones are not modified or duplicated.
+milestones:
+  - title: "Correctness"
+    description: "Fix things that currently produce incorrect results"
+  - title: "Resilience"
+    description: "Add missing checks that let failures go undetected"
+  - title: "Documentation"
+    description: "Fix docs that don't match reality"
+  - title: "Code quality"
+    description: "Not broken, but costly to maintain"
+  - title: "Validation coverage"
+    description: "New validation tests to add"

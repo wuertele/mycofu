@@ -1,0 +1,55 @@
+# Framework image manifest — infrastructure roles built by the pipeline.
+#
+# These are part of the framework (open-source, same for every deployment).
+# Site-specific application roles go in site/images.yaml.
+#
+# build-all-images.sh merges both manifests and errors on duplicate role names.
+# The VM-class taxonomy is declared here with scope/control_plane and read by
+# framework/scripts/vm-scope.sh; do not duplicate role allowlists in scripts.
+
+roles:
+  dns:
+    category: nix
+    host_config: site/nix/hosts/dns.nix
+    flake_output: dns-image
+    scope: env-bound
+    control_plane: false
+  vault:
+    category: nix
+    host_config: site/nix/hosts/vault.nix
+    flake_output: vault-image
+    scope: env-bound
+    control_plane: false
+  gitlab:
+    category: nix
+    host_config: site/nix/hosts/gitlab.nix
+    flake_output: gitlab-image
+    scope: prod-only
+    control_plane: true
+  cicd:
+    category: nix
+    host_config: site/nix/hosts/cicd.nix
+    flake_output: cicd-image
+    scope: shared
+    control_plane: true
+  acme-dev:
+    category: nix
+    host_config: site/nix/hosts/acme-dev.nix
+    flake_output: acme-dev-image
+    scope: dev-only
+    control_plane: false
+  gatus:
+    category: nix
+    host_config: site/nix/hosts/gatus.nix
+    flake_output: gatus-image
+    scope: prod-only
+    control_plane: false
+
+# Non-built VM classes with Tofu modules but no pipeline-built image.
+# build-all-images.sh only iterates roles:, while vm-scope.sh also reads this
+# block so deploy classifiers can account for vendor appliances.
+non_built_roles:
+  pbs:
+    category: vendor
+    scope: shared
+    control_plane: true

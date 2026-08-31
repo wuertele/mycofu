@@ -1,0 +1,51 @@
+# bash32_empty_array_baseline.txt — committed baseline for #410.
+# Each line is an existing UNGUARDED bare "${ARR[@]}"/"${ARR[*]}"
+# expansion of an empty-initialized array in framework/scripts, as a
+# stable (relpath<TAB>ARRAY<TAB>sym) key. These are the currently-present
+# candidates (triaged as existing, mostly non-empty-by-construction or
+# pre-existing). The ratchet fails on any NET-NEW key — including an
+# idiom->bare regression of a currently-safe array (e.g. NIX_BUILD_FLAGS).
+# Regenerate after an intentional change with:
+#   python3 tests/lib/bash32_empty_array_scan.py framework/scripts \
+#     > /tmp/scan && (grep '^#' tests/fixtures/bash32_empty_array_baseline.txt; cat /tmp/scan) \
+#     > tests/fixtures/bash32_empty_array_baseline.txt
+check-boot-integrity.sh	HOSTS	@
+check-boot-integrity.sh	app_hosts	@
+check-boot-integrity.sh	hosts	@
+check-control-plane-drift.sh	HOSTS	@
+check-control-plane-drift.sh	app_hosts	@
+check-control-plane-drift.sh	hosts	@
+cleanup-orphan-cidata.sh	ALL_NODE_IPS	@
+cleanup-orphan-cidata.sh	NODE_IPS	@
+configure-influxdb-tokens.sh	TOKEN_DEFS	@
+configure-influxdb-tokens.sh	auth_args	@
+configure-metrics.sh	MANAGED_NAMES	@
+configure-metrics.sh	TARGETS	@
+configure-nas.sh	ENV_NAMES	@
+configure-node-network.sh	INDICES	@
+configure-node-network.sh	REBOOT_NODES	@
+configure-node-network.sh	result	@
+confirm-empty-vdb-first-deploy.sh	vmids	*
+converge-cluster.sh	NODES	@
+converge-cluster.sh	TARGETS	@
+converge-vm.sh	normalized	*
+converge-vm.sh	raw_targets	@
+deploy-control-plane.sh	selected_hosts	@
+get-deployed-image-hashes.sh	REFS	@
+merge-image-versions.sh	CONTROL_PLANE_HOSTS	@
+merge-image-versions.sh	expected_roles	@
+merge-image-versions.sh	sorted	@
+realign-cidata.sh	NODE_IPS	@
+realign-cidata.sh	VICTIMS	@
+reboot-node-rolling.sh	NODE_INVENTORY	@
+reboot-node-rolling.sh	NODE_NAMES	@
+rebuild-cluster.sh	KERNEL_NODES_WITH_VMS	@
+reset-cluster.sh	NODE_IPS	@
+restore-from-pbs.sh	ORDERED_INDICES	@
+rolling-reboot-node-inner.sh	A0_RELOCATED_VMIDS	@
+rolling-reboot-node-inner.sh	CIDATA_GUARD_DESTS	@
+rolling-reboot-node-inner.sh	INVENTORY_NAMES	@
+tofu-wrapper.sh	TOFU_ARGS	@
+validate.sh	ENVS	@
+validate.sh	pending	@
+vm-scope.sh	normalized_args	@

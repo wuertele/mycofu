@@ -1,0 +1,8 @@
+{
+  "schema": 1,
+  "source_ref": "prod",
+  "source_commit": "964b625b41449b65bafde2bc62c666e87521b3fa",
+  "source_short": "964b625b4144",
+  "published_at": "2026-08-31T01:54:42Z",
+  "publisher": "publish:github"
+}

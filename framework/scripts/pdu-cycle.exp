@@ -1,0 +1,46 @@
+#!/usr/bin/env expect -f
+#
+# pdu-cycle.exp — Drive an APC AOS CLI to inspect or cycle a PDU outlet.
+
+set timeout 30
+set host [lindex $argv 0]
+set user [lindex $argv 1]
+set outlet [lindex $argv 2]
+set action [lindex $argv 3]
+
+if {$host eq "--syntax-check"} {
+  exit 0
+}
+
+if {$host eq "" || $user eq "" || $outlet eq "" || $action eq ""} {
+  puts "usage: pdu-cycle.exp HOST USER OUTLET ACTION"
+  exit 2
+}
+if {![info exists env(PDU_PASSWORD)] || $env(PDU_PASSWORD) eq ""} {
+  puts "PDU_PASSWORD is required"
+  exit 2
+}
+
+spawn ssh -o StrictHostKeyChecking=no \
+          -o PreferredAuthentications=password \
+          -o PubkeyAuthentication=no \
+          -- "$user@$host"
+expect {
+  -nocase "password:" { send "$env(PDU_PASSWORD)\r" }
+  timeout             { puts "auth-prompt timeout"; exit 1 }
+}
+expect {
+  -re {>\s*$} {}
+  timeout     { puts "prompt timeout"; exit 1 }
+}
+
+# AOS commands: olOn / olOff / olReboot / olStatus
+send "ol$action $outlet\r"
+
+expect {
+  -re {>\s*$} {}
+  timeout     { puts "command timeout"; exit 1 }
+}
+
+send "quit\r"
+expect eof

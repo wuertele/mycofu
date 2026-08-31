@@ -1,0 +1,19 @@
+#cloud-config
+hostname: ${hostname}
+manage_etc_hosts: true
+ssh_authorized_keys:
+%{ for key in ssh_pubkeys ~}
+%{ for line in compact(split("\n", key)) ~}
+  - ${line}
+%{ endfor ~}
+%{ endfor ~}
+%{ if length(write_files) > 0 ~}
+write_files:
+%{ for f in write_files ~}
+  - path: ${f.path}
+    content: |
+      ${indent(6, f.content)}
+    permissions: '${f.permissions}'
+    owner: root:root
+%{ endfor ~}
+%{ endif ~}
