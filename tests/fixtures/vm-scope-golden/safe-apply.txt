@@ -1,0 +1,81 @@
+ENV=dev
+RC=0
+WARNING: module module.cpnix_dev does not match any environment -- skipping
+WARNING: module module.cpvendor_dev does not match any environment -- skipping
+WARNING: module module.gitlab does not match any environment -- skipping
+WARNING: module module.pbs does not match any environment -- skipping
+Restore entries: 4
+Targets: -target=module.dns_dev -target=module.grafana_dev -target=module.hil_boot -target=module.vault_dev
+(dry-run — not applying)
+[
+  {
+    "env": "dev",
+    "expected_disks": [
+      "ide2",
+      "scsi0",
+      "scsi1"
+    ],
+    "kind": "control-plane",
+    "module": "module.cpnix_dev",
+    "reason": "create"
+  },
+  {
+    "env": "dev",
+    "expected_disks": [
+      "scsi0"
+    ],
+    "kind": "control-plane",
+    "module": "module.cpvendor_dev",
+    "reason": "create"
+  },
+  {
+    "env": "dev",
+    "expected_disks": [
+      "ide2",
+      "scsi0",
+      "scsi1"
+    ],
+    "kind": "application",
+    "module": "module.grafana_dev",
+    "reason": "create"
+  },
+  {
+    "env": "dev",
+    "expected_disks": [
+      "ide2",
+      "scsi0",
+      "scsi1"
+    ],
+    "kind": "infrastructure",
+    "module": "module.vault_dev",
+    "reason": "create"
+  }
+]
+WRAPPER_LOG
+plan <control-plane-excludes> -out=<tmp>/plan.out -no-color
+---
+ENV=prod
+RC=0
+WARNING: module module.cpnix_dev does not match any environment -- skipping
+WARNING: module module.cpvendor_dev does not match any environment -- skipping
+WARNING: module module.gitlab does not match any environment -- skipping
+WARNING: module module.pbs does not match any environment -- skipping
+Restore entries: 1
+Targets: -target=module.gatus -target=module.grafana_prod
+(dry-run — not applying)
+[
+  {
+    "env": "prod",
+    "expected_disks": [
+      "ide2",
+      "scsi0",
+      "scsi1"
+    ],
+    "kind": "application",
+    "module": "module.grafana_prod",
+    "reason": "create"
+  }
+]
+WRAPPER_LOG
+plan <control-plane-excludes> -out=<tmp>/plan.out -no-color
+---

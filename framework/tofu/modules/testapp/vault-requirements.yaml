@@ -1,0 +1,6 @@
+approles:
+  - name_template: "testapp_${env}"
+    policy: "default-policy"
+    sops_keys:
+      role_id: "vault_approle_testapp_${env}_role_id"
+      secret_id: "vault_approle_testapp_${env}_secret_id"

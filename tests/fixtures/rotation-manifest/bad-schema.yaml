@@ -1,0 +1,5 @@
+- match: alpha_secret
+  class: M1
+  driver: framework/scripts/rotate-alpha.sh
+  probe: framework/scripts/probe-alpha.sh
+  ratified_by: nobody

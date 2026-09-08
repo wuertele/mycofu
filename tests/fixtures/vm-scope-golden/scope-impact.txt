@@ -1,0 +1,77 @@
+SCOPE=
+SHELL_RC=0
+RC=0
+IMPACT=prod_affecting
+REASON=full rebuilds always touch prod-affecting VMs
+UNKNOWN=
+---
+SCOPE=control-plane
+SHELL_RC=0
+RC=0
+IMPACT=shared_control_plane
+REASON=control-plane scope targets shared VMs: gitlab, cicd, pbs
+UNKNOWN=
+---
+SCOPE=data-plane
+SHELL_RC=0
+RC=0
+IMPACT=prod_affecting
+REASON=data-plane scope includes prod data-plane VMs
+UNKNOWN=
+---
+SCOPE=vm=gitlab
+SHELL_RC=0
+RC=0
+IMPACT=shared_control_plane
+REASON=scope includes shared control-plane targets: gitlab
+UNKNOWN=
+---
+SCOPE=vm=hil_boot
+SHELL_RC=0
+RC=0
+IMPACT=shared_control_plane
+REASON=scope includes shared control-plane targets: hil_boot
+UNKNOWN=
+---
+SCOPE=vm=gatus
+SHELL_RC=0
+RC=0
+IMPACT=prod_affecting
+REASON=scope includes prod-affecting targets: gatus
+UNKNOWN=
+---
+SCOPE=vm=acme_dev
+SHELL_RC=0
+RC=0
+IMPACT=dev_only
+REASON=all requested targets are dev-only: acme_dev
+UNKNOWN=
+---
+SCOPE=vm=dns_prod
+SHELL_RC=0
+RC=0
+IMPACT=prod_affecting
+REASON=scope includes prod-affecting targets: dns_prod
+UNKNOWN=
+---
+SCOPE=vm=cicd,pbs
+SHELL_RC=0
+RC=0
+IMPACT=shared_control_plane
+REASON=scope includes shared control-plane targets: cicd, pbs
+UNKNOWN=
+---
+SCOPE=vm=unknownrole
+SHELL_RC=0
+RC=1
+IMPACT=
+REASON=scope includes unknown module name(s)
+UNKNOWN=unknownrole
+---
+SCOPE=nonsense
+SHELL_RC=0
+RC=1
+IMPACT=
+REASON=scope format is not recognized
+UNKNOWN=nonsense
+---

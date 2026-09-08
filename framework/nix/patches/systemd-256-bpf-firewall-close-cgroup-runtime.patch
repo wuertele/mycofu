@@ -1,0 +1,91 @@
+From 5a8c2c95598f17fb79cca07365e70e54a7abcc88 Mon Sep 17 00:00:00 2001
+From: Mike Yuan <me@yhndnzj.com>
+Date: Wed, 19 Jun 2024 21:07:07 +0200
+Subject: [PATCH] core/cgroup: call bpf_firewall_close in cgroup_runtime_free
+
+No functional change, just deduplicate default values
+in cgroup_runtime_free() and remove pointless call in
+unit_free() (at the time it's called the CGRuntime has
+been destroyed already).
+---
+ src/core/bpf-firewall.c |  8 ++------
+ src/core/bpf-firewall.h |  3 ++-
+ src/core/cgroup.c       | 15 +--------------
+ src/core/unit.c         |  2 --
+ 4 files changed, 5 insertions(+), 23 deletions(-)
+
+diff --git a/src/core/bpf-firewall.c b/src/core/bpf-firewall.c
+index 29f62693ee4c7..26f50500cefb2 100644
+--- a/src/core/bpf-firewall.c
++++ b/src/core/bpf-firewall.c
+@@ -970,12 +970,8 @@ void emit_bpf_firewall_warning(Unit *u) {
+         warned = true;
+ }
+
+-void bpf_firewall_close(Unit *u) {
+-        assert(u);
+-
+-        CGroupRuntime *crt = unit_get_cgroup_runtime(u);
+-        if (!crt)
+-                return;
++void bpf_firewall_close(CGroupRuntime *crt) {
++        assert(crt);
+
+         crt->ip_accounting_ingress_map_fd = safe_close(crt->ip_accounting_ingress_map_fd);
+         crt->ip_accounting_egress_map_fd = safe_close(crt->ip_accounting_egress_map_fd);
+diff --git a/src/core/bpf-firewall.h b/src/core/bpf-firewall.h
+index 58b401f834bea..f7b72d0ea1939 100644
+--- a/src/core/bpf-firewall.h
++++ b/src/core/bpf-firewall.h
+@@ -3,6 +3,7 @@
+
+ #include <inttypes.h>
+
++#include "cgroup.h"
+ #include "unit.h"
+
+ enum {
+@@ -22,4 +23,4 @@ int bpf_firewall_reset_accounting(int map_fd);
+
+ void emit_bpf_firewall_warning(Unit *u);
+
+-void bpf_firewall_close(Unit *u);
++void bpf_firewall_close(CGroupRuntime *crt);
+diff --git a/src/core/cgroup.c b/src/core/cgroup.c
+index 41d7dd5adaf8a..dec47e14f7530 100644
+--- a/src/core/cgroup.c
++++ b/src/core/cgroup.c
+@@ -5266,20 +5266,7 @@ CGroupRuntime *cgroup_runtime_free(CGroupRuntime *crt) {
+ #endif
+         fdset_free(crt->initial_restrict_ifaces_link_fds);
+
+-        safe_close(crt->ipv4_allow_map_fd);
+-        safe_close(crt->ipv6_allow_map_fd);
+-        safe_close(crt->ipv4_deny_map_fd);
+-        safe_close(crt->ipv6_deny_map_fd);
+-
+-        bpf_program_free(crt->ip_bpf_ingress);
+-        bpf_program_free(crt->ip_bpf_ingress_installed);
+-        bpf_program_free(crt->ip_bpf_egress);
+-        bpf_program_free(crt->ip_bpf_egress_installed);
+-
+-        set_free(crt->ip_bpf_custom_ingress);
+-        set_free(crt->ip_bpf_custom_ingress_installed);
+-        set_free(crt->ip_bpf_custom_egress);
+-        set_free(crt->ip_bpf_custom_egress_installed);
++        bpf_firewall_close(crt);
+
+         free(crt->cgroup_path);
+
+diff --git a/src/core/unit.c b/src/core/unit.c
+index 0e931be484665..9d64103aef763 100644
+--- a/src/core/unit.c
++++ b/src/core/unit.c
+@@ -844,8 +844,6 @@ Unit* unit_free(Unit *u) {
+         if (u->in_release_resources_queue)
+                 LIST_REMOVE(release_resources_queue, u->manager->release_resources_queue, u);
+
+-        bpf_firewall_close(u);
+-
+         condition_free_list(u->conditions);
+         condition_free_list(u->asserts);

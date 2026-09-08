@@ -1,0 +1,1 @@
+../proxmox-vm/outputs.tf
