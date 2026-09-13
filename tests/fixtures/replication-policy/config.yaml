@@ -1,0 +1,34 @@
+domain: fixture.test
+nodes:
+  - name: pve01
+    mgmt_ip: 10.0.0.1
+  - name: pve02
+    mgmt_ip: 10.0.0.2
+  - name: pve03
+    mgmt_ip: 10.0.0.3
+replication:
+  health_port: 9100
+proxmox:
+  storage_pool: vmstore
+vms:
+  gitlab:
+    vmid: 150
+    backup: true
+  cicd:
+    vmid: 160
+  dns1_dev:
+    vmid: 301
+  vault_dev:
+    vmid: 303
+    backup: true
+  dns1_prod:
+    vmid: 401
+    replicate: "1m"
+  dns2_prod:
+    vmid: 402
+    replicate: "1m"
+  vault_prod:
+    vmid: 403
+    backup: true
+  gatus:
+    vmid: 404

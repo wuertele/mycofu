@@ -1,0 +1,23 @@
+# Bringup Checklist: {{ domain }}
+
+Generated: {{ generation_timestamp }}
+Generator: framework/bringup/generate-bringup.py
+
+**Site configuration:** site/config.yaml
+**Architecture reference:** architecture.md
+**Implementation plan:** implementation-plan.md
+
+## Configuration Summary
+
+| Item | Value |
+|------|-------|
+| Domain | {{ domain }} |
+| Nodes | {{ nodes | length }} ({% for n in nodes %}{{ n.name }}{% if not loop.last %}, {% endif %}{% endfor %}) |
+| Prod VLAN | {{ environments.prod.vlan_id }} ({{ environments.prod.subnet }}) |
+| Dev VLAN | {{ environments.dev.vlan_id }} ({{ environments.dev.subnet }}) |
+| Gateway | {{ platforms.gateway.type }} at {{ platforms.gateway.url }} |
+| NAS | {{ platforms.nas.type }} at {{ platforms.nas.url }} |
+| Registrar | {{ platforms.registrar.type }} at {{ platforms.registrar.url }} |
+| DNS model | Subdomain delegation (prod.{{ domain }} only) |
+| Dev DNS | Internal only (no public delegation) |
+| Replication network | {% if has_replication_network %}Yes{% else %}No{% endif %} |
