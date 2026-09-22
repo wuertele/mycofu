@@ -1,0 +1,6 @@
+{
+  "org": "homelab",
+  "bucket": "default",
+  "retention": "30d",
+  "username": "admin"
+}

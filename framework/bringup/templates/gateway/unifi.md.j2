@@ -1,0 +1,284 @@
+## Gateway & Network Configuration — UniFi ({{ platforms.gateway.model }})
+
+> **Note on Unifi UI navigation:** Ubiquiti frequently reorganizes the Unifi
+> Network application between versions. The navigation paths below were verified
+> on **Unifi Network {{ platforms.gateway.version | default('10.x') }}**. If a
+> menu item is not where described, search for the feature name in the Settings
+> search bar or check Ubiquiti's help documentation for your version.
+
+### VLAN and Network Creation
+
+- [ ] Log into UniFi at [{{ platforms.gateway.url }}]({{ platforms.gateway.url }})
+
+> **Note:** DNS servers ({{ vms.dns1_prod.ip }}, {{ vms.dns2_prod.ip }}) are not
+> running yet. DHCP will advertise them, but DNS resolution won't work until DNS
+> VMs are deployed in Step 3 of the implementation plan.
+
+#### Prod Network (VLAN {{ environments.prod.vlan_id }})
+
+- [ ] Navigate to **Settings** → **Networks** → **Create New Network**
+- [ ] Configure:
+
+| Field | Value |
+|-------|-------|
+| Name | Prod |
+| VLAN ID | {{ environments.prod.vlan_id }} |
+| Gateway IP/Subnet | {{ environments.prod.gateway }}/{{ environments.prod.subnet | cidr_prefix }} |
+| DHCP Mode | DHCP Server |
+| DHCP Range | {{ environments.prod.subnet | subnet_ip(100) }} – {{ environments.prod.subnet | subnet_ip(254) }} |
+| DHCP DNS Server | {{ vms.dns1_prod.ip }}, {{ vms.dns2_prod.ip }} |
+| DHCP Search Domain | {{ environments.prod.dns_domain }} |
+
+- [ ] **DHCP DNS servers** — set to the per-environment DNS server IPs, NOT the gateway:
+  - DNS Server 1: `{{ vms.dns1_prod.ip }}` (dns1-prod)
+  - DNS Server 2: `{{ vms.dns2_prod.ip }}` (dns2-prod)
+
+  > **UI path (UniFi Network {{ platforms.gateway.version | default('10.x') }}):**
+  > **Settings → Networks → Prod → DHCP → DHCP Service Management →**
+  > scroll down to **DNS Server** and switch from "Auto" to "Manual", then
+  > enter the two DNS server IPs above.
+
+  > **WARNING:** Do NOT leave DNS set to "Auto" or use the gateway IP
+  > (`{{ environments.prod.gateway }}`). The gateway does not serve the
+  > per-environment DNS zones. VMs would fail to resolve internal hostnames
+  > like `influxdb.prod.{{ domain }}` and unqualified names like `influxdb`
+  > would not resolve at all. This is the setting that makes
+  > `dig +search vault` from inside a VM resolve to the correct
+  > per-environment IP.
+
+- [ ] Save
+
+#### Dev Network (VLAN {{ environments.dev.vlan_id }})
+
+- [ ] Navigate to **Settings** → **Networks** → **Create New Network**
+- [ ] Configure:
+
+| Field | Value |
+|-------|-------|
+| Name | Dev |
+| VLAN ID | {{ environments.dev.vlan_id }} |
+| Gateway IP/Subnet | {{ environments.dev.gateway }}/{{ environments.dev.subnet | cidr_prefix }} |
+| DHCP Mode | DHCP Server |
+| DHCP Range | {{ environments.dev.subnet | subnet_ip(100) }} – {{ environments.dev.subnet | subnet_ip(254) }} |
+| DHCP DNS Server | {{ vms.dns1_dev.ip }}, {{ vms.dns2_dev.ip }} |
+| DHCP Search Domain | {{ environments.dev.dns_domain }} |
+
+- [ ] **DHCP DNS servers** — set to the per-environment DNS server IPs, NOT the gateway:
+  - DNS Server 1: `{{ vms.dns1_dev.ip }}` (dns1-dev)
+  - DNS Server 2: `{{ vms.dns2_dev.ip }}` (dns2-dev)
+
+  > **UI path (UniFi Network {{ platforms.gateway.version | default('10.x') }}):**
+  > **Settings → Networks → Dev → DHCP → DHCP Service Management →**
+  > scroll down to **DNS Server** and switch from "Auto" to "Manual", then
+  > enter the two DNS server IPs above.
+
+  > **WARNING:** Do NOT leave DNS set to "Auto" or use the gateway IP
+  > (`{{ environments.dev.gateway }}`). The gateway does not serve the
+  > per-environment DNS zones. VMs would fail to resolve internal hostnames
+  > like `influxdb.dev.{{ domain }}` and unqualified names like `influxdb`
+  > would not resolve at all. This is the setting that makes
+  > `dig +search vault` from inside a VM resolve to the correct
+  > per-environment IP.
+
+- [ ] Save
+
+{% if has_zones %}
+### Firewall Zones
+
+Before assigning zones to networks, create them in the Unifi controller:
+- [ ] Navigate to **Settings → Profiles → Zones**
+- [ ] Create zone: **{{ zones.prod.name }}**
+- [ ] Create zone: **{{ zones.dev.name }}**
+
+Then assign zones to networks:
+- [ ] Edit the **Prod** network → set Zone to **{{ zones.prod.name }}**
+- [ ] Edit the **Dev** network → set Zone to **{{ zones.dev.name }}**
+
+#### Inter-Zone Policies
+
+| From | To | Policy | Reason |
+|------|----|--------|--------|
+| {{ zones.prod.name }} | {{ zones.management.name }} | {{ zones.prod.policy.to_management }} | Home devices reach prod services |
+| {{ zones.management.name }} | {{ zones.prod.name }} | {{ zones.prod.policy.from_management }} | Prod VMs (PBS, Gatus) need NAS access |
+| {{ zones.dev.name }} | {{ zones.management.name }} | {{ zones.dev.policy.to_management }} | Dev is isolated |
+| {{ zones.management.name }} | {{ zones.dev.name }} | {{ zones.dev.policy.from_management }} | Nothing needs to reach dev |
+| {{ zones.prod.name }} | {{ zones.dev.name }} | {{ zones.prod.policy.to_dev }} | Prod and dev are isolated |
+| {{ zones.dev.name }} | {{ zones.prod.name }} | {{ zones.dev.policy.to_prod }} | Prod and dev are isolated |
+
+Configure these policies in **Settings → Security → Zones** (or the equivalent
+zone policy editor in your Unifi version). "Block" means default-deny with
+exceptions added as individual firewall rules as needed.
+{% else %}
+### Firewall Rules
+
+No firewall zones configured in config.yaml. Configure inter-VLAN firewall rules
+manually per your gateway documentation.
+
+**Required policies:**
+- Internal → Prod: **Allow** (home devices need to reach prod services)
+- Prod → Internal: **Allow selectively** (PBS and Gatus need NAS access)
+- Internal → Dev: **Block** (exception: operator workstation for SSH/development)
+- Dev → Internal: **Block**
+- Prod ↔ Dev: **Block** in both directions
+{% endif %}
+
+### DHCP Reservations
+
+DHCP reservations on Unifi are created via the **Clients** page, not from the
+network settings.
+
+For each VM, create a reservation:
+- [ ] Navigate to **Clients** (top-level menu in the left sidebar)
+- [ ] Click **+ Add Client** at the top of the page
+
+{% for vm_name, vm in vms.items() %}
+- [ ] Add client: MAC `{{ vm.mac }}`, Name `{{ vm_name }}`,
+      Fixed IP `{{ vm.ip }}`.
+      Leave "Local DNS Record" **unchecked**.
+{% endfor %}
+
+**Note:** "Local DNS Record" creates a record on the Unifi gateway's DNS resolver.
+Leave it unchecked — DNS is managed by PowerDNS, and enabling it would create a
+conflicting source of truth.
+
+**Note:** On Unifi Network 10.x, DHCP reservations are created via the
+**Clients** page (top-level sidebar), not from network settings. On earlier
+versions, check Settings → Networks → [network] → DHCP Reservations.
+
+### DHCP Guarding Check
+
+> **WARNING:** If DHCP Guarding is enabled on your UniFi switch, VMs on tagged
+> VLANs will NOT receive DHCP leases. DHCP Guarding is a security feature that
+> blocks DHCP server responses on ports where they're not expected. On trunk ports
+> carrying tagged VLAN traffic, this blocks the gateway's DHCP responses to VMs.
+
+- [ ] Navigate to **Devices** → select your switch → **Ports** → select each trunk port (ports connected to Proxmox nodes)
+- [ ] Check if **DHCP Guarding** is enabled (under port profile or security settings)
+- [ ] If enabled: either disable DHCP Guarding on trunk ports, or add the gateway as a trusted DHCP server
+
+To verify DHCP is working after any changes:
+```bash
+# Create a temporary test VM on the prod VLAN in the Proxmox UI and check
+# if it receives a DHCP lease. If it gets an IP in {{ environments.prod.subnet }},
+# DHCP is working. Delete the test VM afterward.
+```
+
+### Switch Port Configuration
+
+For each Proxmox node's switch port, configure as a trunk port:
+
+{%- for node in nodes %}
+
+**{{ node.name }}** (management IP: {{ node.mgmt_ip }}):
+- [ ] Identify the physical switch port connected to {{ node.name }}
+- [ ] Set port profile to trunk:
+  - Native VLAN: {{ management.vlan_id }} (management/default)
+  - Tagged VLANs: {{ environments.prod.vlan_id }} (prod), {{ environments.dev.vlan_id }} (dev)
+
+> In UniFi: **Devices** → select switch → **Ports** → select port →
+> **Port Profile** → create or assign a profile with the above VLANs.
+{%- endfor %}
+
+### Port 53 Forwarding (DNS)
+
+DNS queries from the internet must reach the prod DNS authoritative server.
+The DNS VMs run two processes: a **recursor** on port 53 (for VLAN clients)
+and the **authoritative** on port 8053 (for zone data). The port forward must
+target port **8053** (the authoritative), not port 53 (the recursor).
+
+The recursor on port 53 provides full-service DNS to internal VMs but refuses
+non-recursive queries from public resolvers. The port forward must target port
+8053 (the authoritative instance) which responds with the AA flag required for
+valid DNS delegation.
+
+Since a single port forward can only target one IP, forward to dns1 as primary.
+
+**Note:** On Unifi Network 10.x, port forwarding is under **Policy Engine**
+(top-level sidebar item, not inside Settings). On earlier versions, check
+Settings → Routing → Port Forwarding, or Settings → Firewall & Security.
+
+- [ ] Navigate to **Policy Engine** → **Port Forwarding** in the left sidebar
+- [ ] Click **Create New Policy**
+- [ ] Fill in the form:
+
+| Field | Value |
+|-------|-------|
+| Name | `DNS-forward-tcp` |
+| WAN Interface | All |
+| Protocol | TCP |
+| IP Address | (leave as default / Any — this matches your WAN IP) |
+| Port | `53` |
+| From | Any |
+| Forward IP | `{{ vms.dns1_prod.ip }}` |
+| Forward Port | `8053` |
+
+- [ ] Click **Add** to save the rule
+- [ ] Click **Create New Policy** again for UDP:
+
+| Field | Value |
+|-------|-------|
+| Name | `DNS-forward-udp` |
+| WAN Interface | All |
+| Protocol | UDP |
+| IP Address | (leave as default / Any) |
+| Port | `53` |
+| From | Any |
+| Forward IP | `{{ vms.dns1_prod.ip }}` |
+| Forward Port | `8053` |
+
+- [ ] Click **Add** to save the rule
+
+**Why two rules:** DNS uses both TCP and UDP on port 53. UDP handles most
+queries; TCP is used for zone transfers and responses larger than 512 bytes.
+Some Unifi versions have a "Both" protocol option — if available, a single rule
+with Protocol "Both" is equivalent.
+
+**Why port 8053:** The DNS VMs use a split architecture. Port 53 runs the
+pdns-recursor (handles recursive queries for VLAN clients — both local zones
+and external names). Port 8053 runs the PowerDNS authoritative (serves zone
+data with the AA flag). Public resolvers following the NS delegation chain
+require authoritative answers. The WAN port forward translates WAN:53 →
+VM:8053, so public resolvers reach the authoritative directly.
+
+**Why forwarding to dns1 only:** Unifi port forwarding sends traffic to a
+single internal IP. The NS delegation at the registrar lists both dns1 and
+dns2, so external resolvers will try dns2 if dns1 doesn't respond. The port
+forward ensures at least one is reachable from the WAN. If true redundancy
+from the WAN is needed, a more advanced setup (e.g., keepalived with a floating
+VIP) can be added later.
+
+> **Dev DNS:** No port forwarding is needed for dev DNS servers ({{ vms.dns1_dev.ip }},
+> {{ vms.dns2_dev.ip }}). Dev DNS is internal-only — it serves the dev VLAN and is
+> not publicly delegated. Pebble (dev ACME server) queries the DNS servers
+> directly on the VLAN, not via public delegation.
+
+### Verification
+
+- [ ] Connect a device to the Prod VLAN:
+  - [ ] Receives IP in {{ environments.prod.subnet }}
+  - [ ] Gateway: {{ environments.prod.gateway }}
+  - [ ] DNS: {{ vms.dns1_prod.ip }}, {{ vms.dns2_prod.ip }} (NOT {{ environments.prod.gateway }})
+  - [ ] Search domain: {{ environments.prod.dns_domain }}
+
+- [ ] Connect a device to the Dev VLAN:
+  - [ ] Receives IP in {{ environments.dev.subnet }}
+  - [ ] Gateway: {{ environments.dev.gateway }}
+  - [ ] DNS: {{ vms.dns1_dev.ip }}, {{ vms.dns2_dev.ip }} (NOT {{ environments.dev.gateway }})
+  - [ ] Search domain: {{ environments.dev.dns_domain }}
+
+- [ ] Device on Prod VLAN cannot ping Dev gateway ({{ environments.dev.gateway }})
+- [ ] Device on Dev VLAN cannot ping Prod gateway ({{ environments.prod.gateway }})
+
+> **How to verify DNS servers on a running VM:** SSH in and run
+> `networkctl status | grep DNS`. The output should show the per-environment
+> DNS server IPs, not the gateway. If it shows the gateway IP, the DHCP DNS
+> setting is wrong — go back to **Settings → Networks → [VLAN] → DHCP →
+> DHCP Service Management → DNS Server** and set it to "Manual" with the
+> correct IPs. Then restart networkd on VMs: `systemctl restart systemd-networkd`.
+
+- [ ] From an external network (e.g., mobile phone on cellular):
+  ```
+  nmap -p 53 {{ public_ip }}
+  ```
+  Expected: port 53 shows as open (or filtered, if DNS VMs aren't running yet —
+  but NOT closed/rejected, which would indicate the port forward isn't working)

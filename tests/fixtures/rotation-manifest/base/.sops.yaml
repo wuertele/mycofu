@@ -1,0 +1,5 @@
+creation_rules:
+  - path_regex: fixture-sops/site-secrets\.yaml$
+    age: age1fixturefixturefixturefixturefixturefixturefixturefixture000
+  - path_regex: fixture-sops/hil-bfnet-secrets\.yaml$
+    age: age1fixturefixturefixturefixturefixturefixturefixturefixture000
