@@ -1,0 +1,267 @@
+## NAS Configuration — Synology ({{ platforms.nas.model }})
+
+{% set sudo = '' if nas.ssh_user == 'root' else 'sudo ' %}
+{% set pg_method = nas.postgres_method | default('native') %}
+### Prerequisites
+
+- [ ] Log into DSM at [{{ platforms.nas.url }}]({{ platforms.nas.url }})
+{% if pg_method == 'docker' %}
+- [ ] **Container Manager** is installed (Package Center → search "Container Manager" → Install)
+{% endif %}
+- [ ] SSH is enabled (Control Panel → Terminal & SNMP → Enable SSH service)
+- [ ] SSH key authentication configured for `{{ nas.ssh_user }}@{{ nas.ip }}` from operator workstation
+
+### NFS Export (for PBS Backups)
+
+NFS shared folders and permissions must be configured through the DSM web UI —
+there is no reliable CLI for this on Synology. `configure-nas.sh` will verify
+the export is working but cannot create it.
+
+**1. Create a shared folder:**
+
+Navigate to **Control Panel** → **Shared Folder** → **Create**:
+
+| Field | Value |
+|-------|-------|
+| Name | `{{ nas.nfs_export.split('/')[-1] }}` |
+| Location | Volume 1 |
+| Enable Recycle Bin | No (unchecked) |
+
+The wizard will show a "Configure user permissions" pane — leave it at
+defaults and click **Apply**. NFS access is controlled separately in step 3.
+
+> **Note:** Synology DSM creates folders with restrictive POSIX permissions
+> (mode 000 with ACLs). `rebuild-cluster.sh` detects and fixes this
+> automatically during step 0 prerequisites.
+
+- [ ] Shared folder created
+
+**2. Enable NFS:**
+
+Navigate to **Control Panel** → **File Services** → **NFS**:
+
+| Setting | Value |
+|---------|-------|
+| Enable NFS service | Yes |
+| Maximum NFS protocol | NFSv4.1 |
+
+- [ ] NFS service enabled
+
+**3. Set NFS permissions:**
+
+Navigate to **Control Panel** → **Shared Folder** → select the folder → **Edit** → **NFS Permissions** → **Create**:
+
+Management subnet rule:
+
+| Field | Value |
+|-------|-------|
+| Hostname or IP | `{{ management.subnet }}` |
+| Privilege | Read/Write |
+| Squash | No mapping |
+| Security | sys |
+| Enable asynchronous | Yes |
+| Allow connections from non-privileged ports | Yes |
+| Allow users to access mounted subfolders | Yes |
+
+{# Also allow access from prod subnet for the PBS VM #}
+Add a second rule (**Create** again) for the prod subnet:
+
+| Field | Value |
+|-------|-------|
+| Hostname or IP | `{{ environments.prod.subnet }}` |
+| Privilege | Read/Write |
+| Squash | No mapping |
+| Security | sys |
+| Enable asynchronous | Yes |
+| Allow connections from non-privileged ports | Yes |
+| Allow users to access mounted subfolders | Yes |
+
+- [ ] NFS permissions configured for management and prod subnets
+
+> **Important: Squash must be "No mapping"** (not "Map all users to admin").
+> PBS needs to set file ownership as different UIDs (root for setup, backup
+> user for operations). The Synology DSM squash options map to NFS as:
+>
+> | DSM setting | NFS option | PBS works? |
+> |---|---|---|
+> | No mapping | `no_root_squash` | **Yes** |
+> | Map root to admin | `root_squash` | No |
+> | Map all users to admin | `all_squash` | No |
+
+### PostgreSQL Setup
+
+{% if pg_method == 'native' %}
+#### PostgreSQL Setup (Native)
+
+Synology DSM ships PostgreSQL as a system service. `configure-nas.sh` will
+verify it is running, create the OpenTofu database, user, and per-environment
+schemas, configure `pg_hba.conf` for remote access, and set `listen_addresses`
+to allow connections from the management subnet.
+
+> **Dependencies:** The script resolves the PostgreSQL password via a 3-tier
+> cascade: `--password` flag, SOPS secrets, or interactive prompt. Since SOPS
+> is not yet configured at this point in the bringup, the script will prompt
+> you interactively. **Remember the password you choose** — you will enter
+> the same value during SOPS bootstrap in the next section.
+
+Preview what will be done:
+```bash
+framework/scripts/configure-nas.sh --dry-run
+```
+
+Deploy PostgreSQL (will prompt for password):
+```bash
+framework/scripts/configure-nas.sh
+```
+
+The script will:
+1. Verify SSH connectivity to `{{ nas.ssh_user }}@{{ nas.ip }}`
+2. Verify PostgreSQL is running (`pg_isready`)
+3. Create user `tofu` and database `tofu_state` (idempotent)
+4. Create schemas ({% for env_name in environments %}`{{ env_name }}`{% if not loop.last %}, {% endif %}{% endfor %}) in the `tofu_state` database
+5. Configure `pg_hba.conf` for remote access from `{{ management.subnet }}`
+6. Set `listen_addresses = '*'` and restart if needed
+7. Deploy daily `pg_dump` backup with 7-day retention
+8. Verify NFS export from workstation and {{ nodes[0].name }}
+
+- [ ] `configure-nas.sh` completed successfully
+
+> **Note on SSL:** Synology DSM's native PostgreSQL does not enable SSL by default.
+> The OpenTofu `pg` backend defaults to `sslmode=require`, which will fail.
+> The `tofu-wrapper.sh` script appends `?sslmode=disable` to the connection
+> string automatically when `config.yaml → nas.postgres_ssl` is `false` (the default).
+> If you have configured SSL on PostgreSQL, set `nas.postgres_ssl: true` in config.yaml.
+
+After SOPS is configured (next section), you can re-run the script idempotently.
+Subsequent runs will read the password from SOPS automatically:
+```bash
+framework/scripts/configure-nas.sh
+```
+
+#### PostgreSQL Backup
+
+`configure-nas.sh` deploys an automated daily backup to protect OpenTofu state
+against DSM upgrades (the native data directory `/var/services/pgsql` is managed
+by Synology and may be modified during major upgrades):
+
+- **Script:** `/usr/local/bin/pg-backup-tofu.sh`
+- **Schedule:** Daily at 02:00 via `/etc/crontab`
+- **Retention:** 7 days (older dumps are deleted automatically)
+- **Location:** `/volume1/backups/tofu_state_YYYYMMDD.dump`
+
+To restore from a backup:
+```bash
+{{ sudo }}su - postgres -c "pg_restore -C -d postgres /volume1/backups/tofu_state_YYYYMMDD.dump"
+```
+
+{% else %}
+#### PostgreSQL Setup (Docker)
+
+PostgreSQL runs as a Docker container on the NAS, managed by `configure-nas.sh`.
+The script creates the data directory, deploys a `docker-compose.yml`, starts the
+container, waits for readiness, and creates per-environment schemas.
+
+> **Dependencies:** The script resolves the PostgreSQL password via a 3-tier
+> cascade: `--password` flag, SOPS secrets, or interactive prompt. Since SOPS
+> is not yet configured at this point in the bringup, the script will prompt
+> you interactively. **Remember the password you choose** — you will enter
+> the same value during SOPS bootstrap in the next section.
+
+Preview what will be done:
+```bash
+framework/scripts/configure-nas.sh --dry-run
+```
+
+Deploy PostgreSQL (will prompt for password):
+```bash
+framework/scripts/configure-nas.sh
+```
+
+The script will:
+1. Verify SSH connectivity to `{{ nas.ssh_user }}@{{ nas.ip }}`
+2. Detect the available Docker Compose command (`docker compose` v2 or `docker-compose` v1)
+3. Create `/volume1/docker/postgres/data` (owner 999:999 — the `postgres` user inside the container)
+4. Deploy `/volume1/docker/postgres/docker-compose.yml`
+5. Run `docker compose up -d`
+6. Wait for `pg_isready` (up to 30 seconds)
+7. Create schemas ({% for env_name in environments %}`{{ env_name }}`{% if not loop.last %}, {% endif %}{% endfor %}) in the `tofu_state` database
+8. Deploy daily `pg_dump` backup with 7-day retention
+9. Verify NFS export from workstation and {{ nodes[0].name }}
+
+- [ ] `configure-nas.sh` completed successfully
+
+> **Note on SSL:** Docker PostgreSQL does not enable SSL by default.
+> The OpenTofu `pg` backend defaults to `sslmode=require`, which will fail.
+> The `tofu-wrapper.sh` script appends `?sslmode=disable` to the connection
+> string automatically when `config.yaml → nas.postgres_ssl` is `false` (the default).
+> If you have configured SSL on PostgreSQL, set `nas.postgres_ssl: true` in config.yaml.
+
+After SOPS is configured (next section), you can re-run the script idempotently.
+Subsequent runs will read the password from SOPS automatically:
+```bash
+framework/scripts/configure-nas.sh
+```
+
+#### If Remote PostgreSQL Connection Fails — pg_hba.conf
+
+The default `postgres:16` image allows connections from any host (`trust` or
+`md5` for all in the default `pg_hba.conf`). If you need to restrict access,
+create a custom `pg_hba.conf`:
+
+```bash
+ssh {{ nas.ssh_user }}@{{ nas.ip }}
+{{ sudo }}tee /volume1/docker/postgres/pg_hba.conf << 'EOF'
+# TYPE  DATABASE        USER       ADDRESS                METHOD
+local   all             all                               trust
+host    all             all        127.0.0.1/32           trust
+host    all             all        ::1/128                trust
+host    tofu_state tofu  {{ management.subnet }}  md5
+host    tofu_state tofu  {{ environments.prod.subnet }}  md5
+host    tofu_state tofu  {{ environments.dev.subnet }}  md5
+EOF
+```
+
+Then add it to `docker-compose.yml` under the `postgres` service:
+
+```yaml
+    volumes:
+      - /volume1/docker/postgres/data:/var/lib/postgresql/data
+      - /volume1/docker/postgres/pg_hba.conf:/etc/postgresql/pg_hba.conf
+    command: postgres -c hba_file=/etc/postgresql/pg_hba.conf
+```
+
+Restart: `{{ sudo }}docker compose down && {{ sudo }}docker compose up -d`
+{% endif %}
+
+### Verification
+
+Run the verification script to check both PostgreSQL and NFS:
+
+```bash
+framework/scripts/configure-nas.sh --verify
+```
+
+This checks:
+{% if pg_method == 'native' %}
+- `pg_isready` reports PostgreSQL is running
+- TCP connectivity to port {{ nas.postgres_port }}
+- Database `tofu_state` exists
+- User `tofu` exists
+{%- for env_name in environments %}
+- Schema `{{ env_name }}` exists
+{%- endfor %}
+- `pg_hba.conf` has remote access rule
+- Backup script and cron entry configured
+{% else %}
+- TCP connectivity to port {{ nas.postgres_port }}
+- Docker container `tofu-postgres` is running
+- `pg_isready` reports accepting connections
+{%- for env_name in environments %}
+- Schema `{{ env_name }}` exists
+{%- endfor %}
+- Backup script and cron entry configured
+{% endif %}
+- NFS export `{{ nas.nfs_export }}` visible via `showmount`
+- NFS mount/unmount test from {{ nodes[0].name }}
+
+- [ ] `configure-nas.sh --verify` passes all checks

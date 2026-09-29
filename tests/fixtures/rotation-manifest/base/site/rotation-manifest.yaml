@@ -1,0 +1,24 @@
+- match: alpha_secret
+  class: M1
+  driver: framework/scripts/rotate-alpha.sh
+  probe: framework/scripts/probe-alpha.sh
+- match: vault_approle_*
+  class: M2
+  driver: framework/scripts/configure-vault.sh
+  probe: framework/scripts/probe-vault.sh
+- match: ssh_host_keys.*
+  class: M2
+  driver: framework/scripts/deploy.sh
+  probe: framework/scripts/plan.sh
+- match: fixture-sops/hil-bfnet-secrets.yaml:hil_node_password
+  class: M5-automated
+  driver: framework/scripts/install-pve-node.sh
+  probe: tests/test_install_pve_node.sh
+- match: app_declared_token
+  class: M3
+  driver: framework/scripts/ensure-app-secrets.sh
+  probe: framework/scripts/probe-app.sh
+- external: operator_ssh_pubkey
+  driver: "procedure: OPERATIONS.md#operator-personal-key-revocation"
+  probe: "yq -e '.operator_ssh_pubkey' site/config.yaml"
+- excluded: legacy_empty

@@ -1,0 +1,70 @@
+## Repository and Secrets Bootstrap
+
+### Repository Setup
+
+- [ ] Initialize the Git repository and create the framework/site directory structure
+- [ ] Run `framework/scripts/new-site.sh`
+- [ ] Verify `site/config.yaml` is fully populated with site-specific values
+
+### SOPS and Secrets Bootstrap
+
+Run the bootstrap script to generate encryption keys and create the initial secrets file:
+
+```bash
+framework/scripts/bootstrap-sops.sh
+```
+
+The script will:
+- Generate an age keypair (or skip if `operator.age.key` already exists)
+- Write `site/sops/.sops.yaml` with the correct public key
+- Prompt you for:
+  - **Proxmox API password** (the root password set during Proxmox installation)
+  - **OpenTofu PostgreSQL password** (the same password you entered during `configure-nas.sh`)
+- Auto-generate:
+  - **PowerDNS API key** (random 32-byte hex string)
+- Read from `site/config.yaml`:
+  - **SSH public key** (`operator_ssh_pubkey`)
+- Create and encrypt `site/sops/secrets.yaml`
+
+### After the Script Completes
+
+- [ ] **CRITICAL: Back up `operator.age.key`** to a secure location. This file is the
+      root of trust for all encrypted secrets. If lost, secrets cannot be recovered.
+      Suitable locations: password manager, hardware security key, printed paper in a safe.
+
+Install the age key so SOPS can find it automatically:
+
+**macOS:**
+```bash
+mkdir -p ~/Library/Application\ Support/sops/age
+cp operator.age.key ~/Library/Application\ Support/sops/age/keys.txt
+```
+
+**Linux:**
+```bash
+mkdir -p ~/.config/sops/age
+cp operator.age.key ~/.config/sops/age/keys.txt
+```
+
+- [ ] Age key installed to SOPS default location
+- [ ] Verify decryption works: `sops -d site/sops/secrets.yaml > /dev/null` (should exit 0)
+- [ ] Verify key is not tracked: `git status` does NOT show `operator.age.key`
+- [ ] Verify `.sops.yaml` contains only the public key (starts with `age1`), not the private key
+
+### Local Commit
+
+This repository uses two Git remotes (see architecture.md §12.7):
+
+- **`origin`** (private): Self-hosted {{ cicd.system | capitalize }} — receives the
+  full repository including `site/` config, SOPS secrets, and bringup.md.
+- **`public`** (optional): GitHub — receives only `framework/` and documentation.
+  The `main` branch excludes `site/`; use `sync-to-main.sh` to push framework changes.
+
+The private remote doesn't exist yet — {{ cicd.system | capitalize }} is provisioned
+in a later step. For now, commit locally:
+
+```bash
+git add -A && git commit -m "SOPS bootstrap: encrypted secrets and age config"
+```
+
+- [ ] Changes committed locally

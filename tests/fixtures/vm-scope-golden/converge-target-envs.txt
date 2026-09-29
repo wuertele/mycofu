@@ -1,0 +1,46 @@
+TARGETS=
+RC=0
+dev prod
+---
+TARGETS=-target=module.dns_dev
+RC=0
+dev
+---
+TARGETS=-target=module.vault_prod
+RC=0
+prod
+---
+TARGETS=-target=module.gitlab
+RC=0
+prod
+---
+TARGETS=-target=module.gatus
+RC=0
+prod
+---
+TARGETS=-target=module.cicd
+RC=0
+
+---
+TARGETS=-target=module.pbs
+RC=0
+
+---
+TARGETS=-target=module.hil_boot
+RC=0
+
+---
+TARGETS=-target=module.vault_dev -target=module.gatus
+RC=0
+dev prod
+---
+TARGETS=badtoken
+RC=1
+ERROR: converge_target_envs: malformed target token 'badtoken' (expected -target=module.NAME)
+---
+TARGETS=-target=module.unknownrole
+RC=1
+ERROR: converge_target_envs: unrecognized module 'unknownrole' in TOFU_TARGETS
+ERROR:   recognized patterns: *_dev, *_prod, gitlab gatus, cicd pbs hil_boot
+ERROR:   if this is a new module class, add it to converge_target_envs allowlist
+---

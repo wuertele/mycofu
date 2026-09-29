@@ -1,0 +1,25 @@
+applications:
+  influxdb:
+    enabled: true
+    backup: true
+    environments:
+      dev:
+        vmid: 501
+      prod:
+        vmid: 601
+  roon:
+    enabled: true
+    backup: true
+    environments:
+      dev:
+        vmid: 503
+      prod:
+        vmid: 603
+  grafana:
+    enabled: true
+    backup: false
+    environments:
+      dev:
+        vmid: 502
+      prod:
+        vmid: 602
