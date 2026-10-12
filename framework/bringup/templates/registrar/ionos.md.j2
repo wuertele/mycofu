@@ -1,0 +1,84 @@
+## Domain Configuration — IONOS
+
+> **WARNING:** Do NOT change the NS records for **{{ domain }}** itself.
+> The registrar must remain the authoritative nameserver for the base domain.
+> Changing the base NS records will break email delivery (MX, SPF, DMARC).
+>
+> You are only delegating the **prod.{{ domain }}** subdomain to your home DNS servers.
+>
+> **Do NOT go to the "Nameserver" tab** — that changes the NS for the whole domain.
+> Stay in the **DNS** tab to add individual records.
+
+### Subdomain Delegation
+
+- [ ] Log into IONOS at [{{ platforms.registrar.url }}]({{ platforms.registrar.url }})
+- [ ] Navigate to **Domains & SSL** → **{{ domain }}** → **DNS**
+
+Add the A records first, then the NS records. Some registrars validate that the
+nameserver hostname resolves before accepting the NS record.
+
+{# In the IONOS DNS editor, the "Hostname" field is relative to the domain,
+   so entering "dns1" creates dns1.{{ domain }}. For NS "Points to" fields,
+   the fully qualified hostname is required: dns1.{{ domain }}. #}
+
+> **IONOS note:** In the DNS editor, the "Hostname" field is relative to `{{ domain }}`.
+> Enter `dns1` to create `dns1.{{ domain }}`. For NS record "Points to" fields,
+> enter the fully qualified name: `dns1.{{ domain }}`.
+
+**Step 1 — A records (create these first):**
+
+| Type | Hostname | Points to |
+|------|----------|-----------|
+| A | dns1 | {{ public_ip }} |
+| A | dns2 | {{ public_ip }} |
+
+- [ ] A record for `dns1.{{ domain }}` → `{{ public_ip }}` created
+- [ ] A record for `dns2.{{ domain }}` → `{{ public_ip }}` created
+
+**Step 2 — NS records (create after A records exist):**
+
+| Type | Hostname | Points to |
+|------|----------|-----------|
+| NS | prod | dns1.{{ domain }} |
+| NS | prod | dns2.{{ domain }} |
+
+- [ ] NS record delegating `prod.{{ domain }}` → `dns1.{{ domain }}` created
+- [ ] NS record delegating `prod.{{ domain }}` → `dns2.{{ domain }}` created
+
+> **Dev DNS:** The `dev.{{ domain }}` subdomain is intentionally NOT delegated publicly.
+> Dev DNS servers are only reachable within the dev VLAN. No registrar configuration
+> is needed for dev.
+
+### What Should NOT Be Changed
+
+Verify these are intact after adding the delegation records:
+
+- [ ] MX records for {{ domain }} — unchanged
+- [ ] SPF record (TXT) for {{ domain }} — unchanged
+- [ ] DMARC record (_dmarc.{{ domain }}) — unchanged
+- [ ] No NS records for **{{ domain }}** itself were modified
+- [ ] The **Nameserver** tab still shows IONOS default nameservers
+
+### Verification
+
+After records are added (may take minutes to hours to propagate):
+
+```bash
+# Verify A records for nameservers
+dig A dns1.{{ domain }}
+dig A dns2.{{ domain }}
+# Expected: {{ public_ip }} for both
+
+# Verify subdomain delegation
+dig NS prod.{{ domain }}
+# Expected: dns1.{{ domain }}. and dns2.{{ domain }}.
+
+# Verify base domain NS was NOT changed
+dig NS {{ domain }}
+# Expected: IONOS default nameservers (NOT dns1/dns2.{{ domain }})
+```
+
+- [ ] `dig A dns1.{{ domain }}` returns `{{ public_ip }}`
+- [ ] `dig A dns2.{{ domain }}` returns `{{ public_ip }}`
+- [ ] `dig NS prod.{{ domain }}` returns `dns1.{{ domain }}` and `dns2.{{ domain }}`
+- [ ] `dig NS {{ domain }}` still returns IONOS default nameservers

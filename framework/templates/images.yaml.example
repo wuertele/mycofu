@@ -1,0 +1,22 @@
+# Site image manifest — application roles specific to this deployment.
+#
+# Add site-specific VM roles here. Framework infrastructure roles are in
+# framework/images.yaml. Duplicate role names across manifests are an error.
+# scope/control_plane are the VM-class taxonomy source of truth; inspect the
+# resolved view with framework/scripts/vm-scope.sh classes.
+#
+# Examples:
+#   roles:
+#     postgres:
+#       category: nix
+#       host_config: site/nix/hosts/postgres.nix
+#       flake_output: postgres-image
+#       scope: env-bound
+#       control_plane: false
+#     myapp:
+#       category: external
+#       build_script: site/images/myapp/build.sh
+#       scope: env-bound
+#       control_plane: false
+
+roles: {}

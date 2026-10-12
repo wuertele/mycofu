@@ -1,0 +1,4 @@
+# Sprint 030 Scenario A MRC trigger fixture.
+#
+# Whitespace-only edits to this file are used to trigger measurement
+# pipelines without changing NixOS image inputs.

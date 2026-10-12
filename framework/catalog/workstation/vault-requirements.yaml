@@ -1,0 +1,6 @@
+approles:
+  - name_template: "workstation_${env}"
+    policy: "workstation-tailscale-policy"
+    sops_keys:
+      role_id: "vault_approle_workstation_${env}_role_id"
+      secret_id: "vault_approle_workstation_${env}_secret_id"

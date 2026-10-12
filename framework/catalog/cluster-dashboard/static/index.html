@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Cluster Dashboard</title>
+    <link rel="stylesheet" href="/vendor/uPlot.min.css" />
+    <link rel="stylesheet" href="/dashboard.css" />
+  </head>
+  <body>
+    <main class="dashboard-shell">
+      <section class="status-bar">
+        <span id="status-title" class="status-bar-title"></span>
+        <span id="status-banner" class="status-bar-message" aria-live="polite">
+          Loading dashboard config...
+        </span>
+        <div id="toolbar" class="status-bar-controls" hidden></div>
+      </section>
+
+      <section id="dashboard-root" class="dashboard-root">
+        <article class="phase-stub">
+          <h2>Loading cluster state</h2>
+          <p>The dashboard will populate after it receives Proxmox and InfluxDB data.</p>
+        </article>
+      </section>
+    </main>
+
+    <script src="/vendor/uPlot.min.js"></script>
+    <script src="/dashboard.js"></script>
+  </body>
+</html>

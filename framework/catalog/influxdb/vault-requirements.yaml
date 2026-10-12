@@ -1,0 +1,6 @@
+approles:
+  - name_template: "influxdb_${env}"
+    policy: "dashboard-policy"
+    sops_keys:
+      role_id: "vault_approle_influxdb_${env}_role_id"
+      secret_id: "vault_approle_influxdb_${env}_secret_id"
